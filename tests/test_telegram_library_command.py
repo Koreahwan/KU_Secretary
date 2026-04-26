@@ -532,6 +532,43 @@ def test_add_update_and_done_personal_todo_only_marks_personal_items(monkeypatch
     assert not [task for task in tasks if task.source == "personal"]
 
 
+def test_update_personal_todo_time_preserves_existing_title_and_date(monkeypatch, tmp_path):
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    settings = SimpleNamespace(timezone="Asia/Seoul")
+    db.upsert_task(
+        external_id="personal:jp-presentation",
+        source="personal",
+        due_at="2026-04-29T23:59:00+09:00",
+        title="대중문화로보는일본문화론 발표(정원)",
+        status="open",
+        metadata_json={"original_text": "대중문화로보는일본문화론 발표(정원) 04/29 23:59"},
+        user_id=7,
+    )
+    monkeypatch.setattr(pipeline, "_telegram_assignments_cached_payload_for_user", lambda **_kwargs: {"items": []})
+
+    listing = pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    updated = pipeline._format_telegram_update_personal_todo(
+        index="1",
+        text="시간을 12:00로 수정",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    listing_after_update = pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+
+    assert "1. [개인] 대중문화로보는일본문화론 발표(정원)" in listing
+    assert "마감 04/29 23:59" in listing
+    assert "[KU] 개인 할일 수정" in updated
+    assert "대중문화로보는일본문화론 발표(정원)" in updated
+    assert "마감 04/29 12:00" in updated
+    assert "1. [개인] 대중문화로보는일본문화론 발표(정원)" in listing_after_update
+    assert "마감 04/29 12:00" in listing_after_update
+
+
 def test_parse_board_aliases():
     expected = {"command": "lms_board", "ok": True}
     for cmd in ("/board", "/lms_board", "/lmsboard", "/announcements", "/공지"):

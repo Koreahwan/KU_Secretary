@@ -10201,6 +10201,122 @@ def _parse_personal_todo_text(text: Any, *, timezone_name: str = "Asia/Seoul") -
     return (title or original, due_at)
 
 
+def _personal_todo_date_hint(text: Any, *, timezone_name: str = "Asia/Seoul") -> tuple[Any | None, str]:
+    body = str(text or "")
+    local_tz = ZoneInfo(timezone_name)
+    now_local = datetime.now(local_tz)
+    relative_dates = {
+        "오늘": now_local.date(),
+        "내일": (now_local + timedelta(days=1)).date(),
+        "모레": (now_local + timedelta(days=2)).date(),
+    }
+    for token, value in relative_dates.items():
+        if token in body:
+            return value, token
+    match = re.search(
+        r"(?<!\d)(?:(?P<year>\d{4})[./-])?(?P<month>\d{1,2})[./-](?P<day>\d{1,2})(?!\d)",
+        body,
+    )
+    if not match:
+        return None, ""
+    try:
+        return (
+            datetime(
+                int(match.group("year") or now_local.year),
+                int(match.group("month")),
+                int(match.group("day")),
+                tzinfo=local_tz,
+            ).date(),
+            match.group(0),
+        )
+    except ValueError:
+        return None, ""
+
+
+def _personal_todo_time_hint(text: Any) -> tuple[tuple[int, int] | None, str]:
+    body = str(text or "")
+    match = re.search(r"(?<!\d)(?P<hour>\d{1,2}):(?P<minute>\d{2})(?!\d)", body) or re.search(
+        r"(?<!\d)(?P<hour>\d{1,2})\s*시(?:\s*(?P<minute>\d{1,2})\s*분?)?",
+        body,
+    )
+    if not match:
+        return None, ""
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute") or 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return None, ""
+    return (hour, minute), match.group(0)
+
+
+def _clean_personal_todo_update_title(text: Any, *, date_token: str = "", time_token: str = "") -> str:
+    body = re.sub(r"\s+", " ", str(text or "").strip())
+    for token in (date_token, time_token):
+        if token:
+            body = body.replace(token, " ", 1)
+    body = re.sub(r"\b(due|by|at)\b", " ", body, flags=re.IGNORECASE)
+    body = re.sub(r"(오늘|내일|모레)", " ", body)
+    body = re.sub(r"(마감|기한|날짜|일자|시간|시각)", " ", body)
+    body = re.sub(r"(까지|전까지|으로|로|을|를|은|는|만)", " ", body)
+    body = re.sub(r"(수정|변경|바꿔줘|바꿔|바꾸기|해주세요|해줘)", " ", body)
+    return re.sub(r"\s+", " ", body).strip(" -:/")
+
+
+def _parse_personal_todo_update_text(
+    text: Any,
+    *,
+    current_title: Any,
+    current_due_at: Any,
+    timezone_name: str = "Asia/Seoul",
+) -> tuple[str, str | None]:
+    body = re.sub(r"\s+", " ", str(text or "").strip())
+    title_fallback = str(current_title or "").strip() or "할일"
+    current_due = _parse_dt(str(current_due_at or ""))
+    current_due_local = None
+    if current_due is not None:
+        current_due_local = current_due.astimezone(ZoneInfo(timezone_name))
+
+    if re.search(r"(마감|기한|날짜|일자|시간|시각).*(삭제|지워|없음|없이|없애)", body):
+        title_candidate = _clean_personal_todo_update_title(body)
+        return title_candidate or title_fallback, None
+
+    date_hint, date_token = _personal_todo_date_hint(body, timezone_name=timezone_name)
+    time_hint, time_token = _personal_todo_time_hint(body)
+    if date_hint is not None or time_hint is not None:
+        parsed_title, parsed_due = _parse_personal_todo_text(body, timezone_name=timezone_name)
+        title_candidate = _clean_personal_todo_update_title(
+            body,
+            date_token=date_token,
+            time_token=time_token,
+        )
+        title = title_candidate or title_fallback
+        base_date = date_hint
+        if base_date is None and current_due_local is not None:
+            base_date = current_due_local.date()
+        if base_date is None:
+            return title, parsed_due
+        base_time = time_hint
+        if base_time is None and current_due_local is not None:
+            base_time = (current_due_local.hour, current_due_local.minute)
+        if base_time is None:
+            base_time = (23, 59)
+        due_at = datetime(
+            base_date.year,
+            base_date.month,
+            base_date.day,
+            base_time[0],
+            base_time[1],
+            tzinfo=ZoneInfo(timezone_name),
+        ).isoformat()
+        return title, due_at
+
+    title_match = re.match(
+        r"^(?:제목|내용|할일)\s*(?:을|를)?\s*(?P<title>.+?)\s*(?:으로|로)?\s*(?:수정|변경|바꿔줘|바꿔|바꾸기)?$",
+        body,
+    )
+    title = title_match.group("title").strip(" -:/") if title_match else body
+    return title or title_fallback, str(current_due_at or "").strip() or None
+
+
 def _personal_todo_external_id(
     *,
     user_id: int | None,
@@ -10600,7 +10716,12 @@ def _format_telegram_update_personal_todo(
     if current is None or str(current.get("source") or "").strip().lower() != "personal":
         return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
     timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
-    title, due_at = _parse_personal_todo_text(new_text, timezone_name=timezone_name)
+    title, due_at = _parse_personal_todo_update_text(
+        new_text,
+        current_title=current.get("title"),
+        current_due_at=current.get("due_at"),
+        timezone_name=timezone_name,
+    )
     metadata = _json_load(current.get("metadata_json"))
     metadata.update(
         {
