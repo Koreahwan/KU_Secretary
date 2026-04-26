@@ -57,16 +57,31 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
         if query:
             payload["library"] = query
         return payload
-    if command in {"/assignments", "/due", "/homework", "/todo", "/to_submit", "/과제", "/제출할거", "/해야할거"}:
+    if command in {"/assignments", "/due", "/homework", "/to_submit", "/과제", "/제출할거", "/해야할거"}:
         query = body[len(parts[0]) :].strip().lower()
         payload = {"command": "assignments", "ok": True}
         if query in {"refresh", "새로고침", "reload"}:
             payload["refresh"] = True
         return payload
+    if command in {"/todo", "/todos", "/tasks", "/할일"}:
+        query = body[len(parts[0]) :].strip().lower()
+        payload = {"command": "todo", "ok": True}
+        if query in {"refresh", "새로고침", "reload"}:
+            payload["refresh"] = True
+        return payload
+    if command in {"/add", "/todoadd", "/할일추가"}:
+        text = body[len(parts[0]) :].strip()
+        if not text:
+            return {"command": "todo_add", "ok": False, "error": "expected '/add <task>'"}
+        return {"command": "todo_add", "ok": True, "text": text}
     if command in {"/assignment", "/과제상세"}:
         if len(parts) < 2:
             return {"command": "assignment_detail", "ok": False, "error": "expected '/assignment <number>'"}
         return {"command": "assignment_detail", "ok": True, "index": parts[1].strip()}
+    if command in {"/task", "/todo_detail", "/할일상세"}:
+        if len(parts) < 2:
+            return {"command": "todo_detail", "ok": False, "error": "expected '/task <number>'"}
+        return {"command": "todo_detail", "ok": True, "index": parts[1].strip()}
     if command in {"/week", "/weekly", "/이번주"}:
         return {"command": "assignment_week", "ok": True}
     if command in {"/submitted", "/submissions", "/done_assignments", "/제출완료", "/낸과제"}:
@@ -96,6 +111,10 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
                 "error": "expected '/plan <instruction>'",
             }
         return {"command": "plan", "ok": True, "instruction": instruction}
+    if command in {"/done", "/todo_done", "/완료"}:
+        if len(parts) < 2:
+            return {"command": "todo_done", "ok": False, "error": "expected '/done <number>'"}
+        return {"command": "todo_done", "ok": True, "index": parts[1].strip()}
     if command in {"/bot", "/assistant", "/asis"}:
         request_text = body[len(parts[0]) :].strip()
         if not request_text:

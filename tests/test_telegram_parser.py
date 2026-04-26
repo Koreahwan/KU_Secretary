@@ -61,12 +61,8 @@ def test_normalize_updates_honors_chat_filter() -> None:
     assert items[0].external_id == "telegram:update:1"
 
 
-def test_parse_command_message_done_command_removed() -> None:
+def test_parse_command_message_draft_commands_removed() -> None:
     for text in (
-        "/done",
-        "/done task",
-        "/done task inbox:123",
-        "/done review 123",
         "/inbox",
         "/apply",
         "/apply all",
@@ -76,6 +72,18 @@ def test_parse_command_message_done_command_removed() -> None:
         assert parsed is not None
         assert parsed["ok"] is False
         assert parsed["command"] == "unknown"
+
+
+def test_parse_command_message_todo_commands() -> None:
+    assert parse_command_message("/todo") == {"command": "todo", "ok": True}
+    assert parse_command_message("/todo refresh") == {"command": "todo", "ok": True, "refresh": True}
+    assert parse_command_message("/add 운영체제 복습 내일 22:00") == {
+        "command": "todo_add",
+        "ok": True,
+        "text": "운영체제 복습 내일 22:00",
+    }
+    assert parse_command_message("/task 3") == {"command": "todo_detail", "ok": True, "index": "3"}
+    assert parse_command_message("/done 3") == {"command": "todo_done", "ok": True, "index": "3"}
 
 
 def test_classify_message_command() -> None:

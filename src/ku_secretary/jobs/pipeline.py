@@ -161,6 +161,7 @@ TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE = 5
 TELEGRAM_LMS_MESSAGE_SOFT_LIMIT = 3600
 TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS = 180
 TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX = "telegram_assignments_cache"
+TELEGRAM_TODO_CACHE_JOB_PREFIX = "telegram_todo_cache"
 TELEGRAM_ASSIGNMENT_WEEK_LOOKAHEAD_DAYS = 7
 PORTAL_SECURE_STORAGE_MISSING_REASON = "KU portal session missing from secure storage; reconnect required"
 UCLASS_SECURE_STORAGE_MISSING_REASON = "UClass token missing from secure storage; reconnect required"
@@ -9313,6 +9314,19 @@ def _telegram_assignments_cache_job_name(
     return f"{TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX}:{digest}"
 
 
+def _telegram_todo_cache_job_name(
+    *,
+    user_id: int | None,
+    chat_id: str | int | None,
+) -> str:
+    payload = {
+        "user_id": _safe_int(user_id),
+        "chat_id": str(chat_id or "").strip() or None,
+    }
+    digest = sha1(json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{TELEGRAM_TODO_CACHE_JOB_PREFIX}:{digest}"
+
+
 def _get_cached_telegram_assignments_payload(
     db: Database | None,
     *,
@@ -10102,6 +10116,475 @@ def _format_telegram_assignment_week(
     if remaining > 0:
         lines.append(f"- 외 {remaining}건")
     return "\n".join(lines)
+
+
+def _parse_personal_todo_text(text: Any, *, timezone_name: str = "Asia/Seoul") -> tuple[str, str | None]:
+    original = re.sub(r"\s+", " ", str(text or "").strip())
+    if not original:
+        return "할일", None
+    local_tz = ZoneInfo(timezone_name)
+    now_local = datetime.now(local_tz)
+    working = original
+    target_date = None
+    target_time: tuple[int, int] | None = None
+    date_match_text = ""
+    time_match_text = ""
+
+    relative_dates = {
+        "오늘": now_local.date(),
+        "내일": (now_local + timedelta(days=1)).date(),
+        "모레": (now_local + timedelta(days=2)).date(),
+    }
+    for token, value in relative_dates.items():
+        if token in working:
+            target_date = value
+            date_match_text = token
+            break
+
+    if target_date is None:
+        date_match = re.search(
+            r"(?<!\d)(?:(?P<year>\d{4})[./-])?(?P<month>\d{1,2})[./-](?P<day>\d{1,2})(?!\d)",
+            working,
+        )
+        if date_match:
+            year = int(date_match.group("year") or now_local.year)
+            month = int(date_match.group("month"))
+            day = int(date_match.group("day"))
+            try:
+                target_date = datetime(year, month, day, tzinfo=local_tz).date()
+                date_match_text = date_match.group(0)
+            except ValueError:
+                target_date = None
+
+    colon_time = re.search(r"(?<!\d)(?P<hour>\d{1,2}):(?P<minute>\d{2})(?!\d)", working)
+    korean_time = re.search(
+        r"(?<!\d)(?P<hour>\d{1,2})\s*시(?:\s*(?P<minute>\d{1,2})\s*분?)?",
+        working,
+    )
+    time_match = colon_time or korean_time
+    if time_match:
+        hour = int(time_match.group("hour"))
+        minute = int(time_match.group("minute") or 0)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            target_time = (hour, minute)
+            time_match_text = time_match.group(0)
+
+    if target_date is None and target_time is not None:
+        candidate = now_local.replace(
+            hour=target_time[0],
+            minute=target_time[1],
+            second=0,
+            microsecond=0,
+        )
+        if candidate <= now_local:
+            candidate += timedelta(days=1)
+        target_date = candidate.date()
+
+    due_at = None
+    if target_date is not None:
+        hour, minute = target_time or (23, 59)
+        due_at = datetime(
+            target_date.year,
+            target_date.month,
+            target_date.day,
+            hour,
+            minute,
+            tzinfo=local_tz,
+        ).isoformat()
+
+    for token in (date_match_text, time_match_text):
+        if token:
+            working = working.replace(token, " ", 1)
+    title = re.sub(r"\b(due|by|at)\b", " ", working, flags=re.IGNORECASE)
+    title = re.sub(r"(까지|마감|전까지)", " ", title)
+    title = re.sub(r"\s+", " ", title).strip(" -:/")
+    return (title or original, due_at)
+
+
+def _personal_todo_external_id(
+    *,
+    user_id: int | None,
+    chat_id: str | int | None,
+    text: Any,
+    created_at: datetime,
+) -> str:
+    payload = {
+        "user_id": _safe_int(user_id),
+        "chat_id": str(chat_id or "").strip() or None,
+        "text": str(text or "").strip(),
+        "created_at": created_at.astimezone(timezone.utc).isoformat(),
+    }
+    digest = sha1(json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"personal:{digest[:24]}"
+
+
+def _task_to_personal_todo_item(task: Task, *, index: int) -> dict[str, Any]:
+    metadata = _json_load(task.metadata_json)
+    return {
+        "index": index,
+        "kind": "personal",
+        "title": str(task.title or "").strip() or "할일",
+        "due_at": str(task.due_at or "").strip(),
+        "source_label": "개인",
+        "course_name": "",
+        "task_selector": str(task.external_id or "").strip(),
+        "status": str(task.status or "").strip(),
+        "original_text": str(metadata.get("original_text") or "").strip(),
+        "type": "personal",
+        "sort_due": _parse_dt(str(task.due_at or "")),
+    }
+
+
+def _telegram_todo_cached_payload_for_user(
+    *,
+    settings: Settings | None,
+    db: Database | None,
+    user_id: int | None,
+    chat_id: str | int | None,
+    allow_refresh: bool = False,
+) -> dict[str, Any] | None:
+    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
+    now = datetime.now(timezone.utc)
+    payload = _get_cached_telegram_assignments_payload(
+        db,
+        job_name=job_name,
+        user_id=user_id,
+        now=now,
+    )
+    if payload is not None or not allow_refresh:
+        return payload
+    _format_telegram_todo(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+        force_refresh=True,
+    )
+    return _get_cached_telegram_assignments_payload(
+        db,
+        job_name=job_name,
+        user_id=user_id,
+        now=datetime.now(timezone.utc),
+    )
+
+
+def _format_telegram_todo(
+    *,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+    force_refresh: bool = False,
+) -> str:
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    local_tz = ZoneInfo(timezone_name)
+    cache_job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
+    cache_now = datetime.now(timezone.utc)
+    if not force_refresh:
+        cached_message = _get_cached_telegram_assignments(
+            db,
+            job_name=cache_job_name,
+            user_id=user_id,
+            now=cache_now,
+        )
+        if cached_message is not None:
+            return cached_message
+
+    personal_items: list[dict[str, Any]] = []
+    if db is not None:
+        try:
+            personal_tasks = [
+                task
+                for task in db.list_open_tasks(limit=300, user_id=user_id)
+                if str(task.source or "").strip().lower() == "personal"
+            ]
+        except Exception:
+            personal_tasks = []
+        for task in personal_tasks:
+            personal_items.append(
+                _task_to_personal_todo_item(
+                    task,
+                    index=0,
+                )
+            )
+
+    if force_refresh:
+        _format_telegram_assignments(
+            settings=settings,
+            db=db,
+            user_id=user_id,
+            chat_id=chat_id,
+            force_refresh=True,
+        )
+    assignment_payload = _telegram_assignments_cached_payload_for_user(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+        allow_refresh=True,
+    )
+    raw_lms_items = assignment_payload.get("items") if isinstance(assignment_payload, dict) else []
+    lms_items: list[dict[str, Any]] = []
+    if isinstance(raw_lms_items, list):
+        for item in raw_lms_items:
+            if not isinstance(item, dict):
+                continue
+            lms_items.append(
+                {
+                    "index": 0,
+                    "kind": "lms",
+                    "title": str(item.get("title") or "").strip() or "(제목 없음)",
+                    "due_at": str(item.get("due_at") or "").strip(),
+                    "source_label": str(item.get("source_label") or "").strip() or "LMS",
+                    "course_name": str(item.get("course_name") or "").strip(),
+                    "evidence": str(item.get("evidence") or "").strip(),
+                    "lms_index": item.get("index"),
+                    "type": str(item.get("type") or "assignment").strip(),
+                    "sort_due": _parse_dt(str(item.get("due_at") or "")),
+                }
+            )
+
+    def sort_key(item: dict[str, Any]) -> tuple[datetime, int, str, str]:
+        due_dt = item.get("sort_due")
+        if not isinstance(due_dt, datetime):
+            due_dt = datetime.max.replace(tzinfo=timezone.utc)
+        return (
+            due_dt.astimezone(timezone.utc),
+            0 if item.get("kind") == "personal" else 1,
+            str(item.get("course_name") or ""),
+            str(item.get("title") or ""),
+        )
+
+    rows = sorted([*personal_items, *lms_items], key=sort_key)
+    cache_items: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        row["index"] = idx
+        row.pop("sort_due", None)
+        cache_items.append(dict(row))
+
+    lines = ["[KU] 할일", ""]
+    if not cache_items:
+        lines.append("- 할일이 없습니다.")
+        lines.extend(["", "추가: /add <내용>"])
+        message = "\n".join(lines)
+        _store_cached_telegram_assignments(
+            db,
+            job_name=cache_job_name,
+            user_id=user_id,
+            message=message,
+            generated_at=cache_now,
+            items=[],
+        )
+        return message
+
+    today = datetime.now(local_tz).date()
+    week_end = today + timedelta(days=7)
+    sections: list[tuple[str, list[dict[str, Any]]]] = [
+        ("오늘", []),
+        ("이번 주", []),
+        ("이후", []),
+        ("마감 없음", []),
+    ]
+    section_map = {name: bucket for name, bucket in sections}
+    for item in cache_items:
+        due_dt = _parse_dt(str(item.get("due_at") or ""))
+        if due_dt is None:
+            section_map["마감 없음"].append(item)
+            continue
+        due_date = due_dt.astimezone(local_tz).date()
+        if due_date <= today:
+            section_map["오늘"].append(item)
+        elif due_date <= week_end:
+            section_map["이번 주"].append(item)
+        else:
+            section_map["이후"].append(item)
+
+    for section_name, section_rows in sections:
+        if not section_rows:
+            continue
+        lines.append(section_name)
+        for item in section_rows:
+            kind = str(item.get("kind") or "")
+            if kind == "personal":
+                title = f"{item.get('index')}. [개인] {item.get('title') or '할일'}"
+                details = []
+            else:
+                course = _compact_lms_course_name(item.get("course_name") or "LMS")
+                title = f"{item.get('index')}. [{course}] {item.get('title') or '(제목 없음)'}"
+                details = [str(item.get("source_label") or "LMS").strip()]
+            due_at = str(item.get("due_at") or "").strip()
+            if due_at:
+                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=title, details=details)
+        lines.append("")
+    while lines and lines[-1] == "":
+        lines.pop()
+    lines.extend(["", "상세: /task <번호>", "개인 할일 추가: /add <내용>", "개인 완료: /done <번호>"])
+
+    message = "\n".join(lines)
+    _store_cached_telegram_assignments(
+        db,
+        job_name=cache_job_name,
+        user_id=user_id,
+        message=message,
+        generated_at=cache_now,
+        items=cache_items,
+    )
+    return message
+
+
+def _format_telegram_todo_detail(
+    *,
+    index: Any,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    try:
+        target_index = int(str(index or "").strip())
+    except (TypeError, ValueError):
+        return "사용법: /task <번호>"
+    payload = _telegram_todo_cached_payload_for_user(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+        allow_refresh=False,
+    )
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return "상세를 볼 할일 캐시가 없습니다. 먼저 /todo 를 실행하세요."
+    item = next(
+        (row for row in items if isinstance(row, dict) and int(row.get("index") or 0) == target_index),
+        None,
+    )
+    if item is None:
+        return f"{target_index}번 할일을 찾지 못했습니다. /todo 에 표시된 번호를 사용하세요."
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    lines = [f"[KU] 할일 상세 #{target_index}", "", str(item.get("title") or "할일").strip()]
+    details = []
+    if item.get("kind") == "personal":
+        details.append("개인")
+    else:
+        course_name = str(item.get("course_name") or "").strip()
+        if course_name:
+            details.append(course_name)
+        source_label = str(item.get("source_label") or "").strip()
+        if source_label:
+            details.append(source_label)
+    due_at = str(item.get("due_at") or "").strip()
+    if due_at:
+        details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+    if details:
+        lines.append(" | ".join(details))
+    if item.get("kind") == "personal":
+        original_text = _truncate_lms_text(item.get("original_text") or "", 500)
+        if original_text and original_text != str(item.get("title") or "").strip():
+            lines.extend(["", "입력", original_text])
+        lines.extend(["", f"완료: /done {target_index}"])
+    else:
+        evidence = _truncate_lms_text(item.get("evidence") or "", 700)
+        if evidence:
+            lines.extend(["", "근거", evidence])
+        lms_index = str(item.get("lms_index") or "").strip()
+        if lms_index:
+            lines.extend(["", f"LMS 상세: /assignment {lms_index}"])
+        lines.append("LMS 항목은 제출 상태를 직접 확인합니다.")
+    return "\n".join(lines)
+
+
+def _format_telegram_add_personal_todo(
+    *,
+    text: Any,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    if db is None:
+        return "개인 할일 저장소를 사용할 수 없습니다."
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    title, due_at = _parse_personal_todo_text(text, timezone_name=timezone_name)
+    created_at = datetime.now(timezone.utc)
+    external_id = _personal_todo_external_id(
+        user_id=user_id,
+        chat_id=chat_id,
+        text=text,
+        created_at=created_at,
+    )
+    db.upsert_task(
+        external_id=external_id,
+        source="personal",
+        due_at=due_at,
+        title=title,
+        status="open",
+        metadata_json={
+            "kind": "personal",
+            "created_via": "telegram",
+            "chat_id": str(chat_id or "").strip(),
+            "original_text": str(text or "").strip(),
+            "created_at": created_at.isoformat(),
+        },
+        user_id=user_id,
+    )
+    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
+    try:
+        db.update_sync_state(job_name, last_run_at=None, last_cursor_json={}, user_id=user_id)
+    except Exception:
+        logger.debug("failed to clear telegram todo cache", exc_info=True)
+    lines = ["[KU] 개인 할일 추가", "", title]
+    if due_at:
+        lines.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+    lines.extend(["", "확인: /todo"])
+    return "\n".join(lines)
+
+
+def _format_telegram_done_personal_todo(
+    *,
+    index: Any,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    if db is None:
+        return "개인 할일 저장소를 사용할 수 없습니다."
+    try:
+        target_index = int(str(index or "").strip())
+    except (TypeError, ValueError):
+        return "사용법: /done <번호>"
+    payload = _telegram_todo_cached_payload_for_user(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+        allow_refresh=False,
+    )
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return "완료 처리할 할일 캐시가 없습니다. 먼저 /todo 를 실행하세요."
+    item = next(
+        (row for row in items if isinstance(row, dict) and int(row.get("index") or 0) == target_index),
+        None,
+    )
+    if item is None:
+        return f"{target_index}번 할일을 찾지 못했습니다. /todo 에 표시된 번호를 사용하세요."
+    if item.get("kind") != "personal":
+        return (
+            "LMS 과제는 수동 완료 처리하지 않습니다.\n"
+            "제출 후 /submitted 또는 /assignments refresh로 LMS 제출 상태를 확인하세요."
+        )
+    selector = str(item.get("task_selector") or "").strip()
+    updated = db.update_task_status(selector, "done", user_id=user_id)
+    if updated is None:
+        return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
+    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
+    try:
+        db.update_sync_state(job_name, last_run_at=None, last_cursor_json={}, user_id=user_id)
+    except Exception:
+        logger.debug("failed to clear telegram todo cache", exc_info=True)
+    return "\n".join(["[KU] 개인 할일 완료", "", str(updated.get("title") or item.get("title") or "할일"), "", "확인: /todo"])
 
 
 def _truncate_lms_text(value: Any, limit: int = 64) -> str:
@@ -11476,7 +11959,11 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "notice_general", "description": "학교 일반공지 10개 보기"},
         {"command": "notice_academic", "description": "학교 학사공지 10개 보기"},
         {"command": "library", "description": "도서관 좌석 현황 보기"},
-        {"command": "assignments", "description": "내야 할 과제 목록 보기"},
+        {"command": "todo", "description": "개인 할일과 LMS 과제 통합 보기"},
+        {"command": "add", "description": "개인 할일 추가"},
+        {"command": "task", "description": "할일 상세 보기"},
+        {"command": "done", "description": "개인 할일 완료 처리"},
+        {"command": "assignments", "description": "내야 할 LMS 과제만 보기"},
         {"command": "assignment", "description": "과제 상세 보기"},
         {"command": "week", "description": "이번 주 마감 보기"},
         {"command": "submitted", "description": "제출 완료 과제 보기"},
@@ -11594,7 +12081,11 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /notice_general : 학교 일반공지",
         "- /notice_academic : 학교 학사공지",
         "- /library [도서관명] : 도서관 좌석 현황 (예: /library 중앙도서관)",
-        "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목 (refresh로 새로고침)",
+        "- /todo : 개인 할일 + LMS 과제 통합 보기 (refresh로 새로고침)",
+        "- /add <내용> : 개인 할일 추가 (예: /add 운영체제 복습 내일 22:00)",
+        "- /task <번호> : /todo 항목 상세 보기",
+        "- /done <번호> : 개인 할일 완료 처리",
+        "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목만 보기",
         "- /assignment <번호> : /assignments 항목 상세 보기",
         "- /week : 이번 주 마감 과제",
         "- /submitted : 제출 완료 LMS 과제 (별칭: /submissions /제출완료)",
@@ -11638,7 +12129,9 @@ def _format_telegram_start(
             "- 다른 학교는 일부 연결 정보만 확인될 수 있습니다.",
             "",
             "주요 명령",
-            "- /assignments : 내야 할 과제",
+            "- /todo : 개인 할일 + LMS 과제",
+            "- /add <내용> : 개인 할일 추가",
+            "- /assignments : LMS 과제만 보기",
             "- /submitted : 제출 완료 과제",
             "- /today : 오늘 일정",
             "- /board : 과목별 공지/게시판",
@@ -12302,6 +12795,50 @@ def _execute_telegram_command(
         return {
             "ok": True,
             "message": _format_telegram_library(command_payload.get("library")),
+        }
+    if command == "todo":
+        return {
+            "ok": True,
+            "message": _format_telegram_todo(
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+                force_refresh=bool(command_payload.get("refresh")),
+            ),
+        }
+    if command == "todo_add":
+        return {
+            "ok": True,
+            "message": _format_telegram_add_personal_todo(
+                text=command_payload.get("text"),
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
+        }
+    if command == "todo_detail":
+        return {
+            "ok": True,
+            "message": _format_telegram_todo_detail(
+                index=command_payload.get("index"),
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
+        }
+    if command == "todo_done":
+        return {
+            "ok": True,
+            "message": _format_telegram_done_personal_todo(
+                index=command_payload.get("index"),
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
         }
     if command == "assignments":
         return {

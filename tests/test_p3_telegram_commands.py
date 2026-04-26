@@ -67,7 +67,10 @@ def test_sync_telegram_registers_bot_menu_commands(
     assert {"command": "setup", "description": "연결 상태 점검"} not in commands
     assert {"command": "connect", "description": "학교 계정 연결"} not in commands
     assert {"command": "plan", "description": "자연어 리마인더 예약"} not in commands
-    assert {"command": "done", "description": "과제 완료 처리하기"} not in commands
+    assert {"command": "todo", "description": "개인 할일과 LMS 과제 통합 보기"} in commands
+    assert {"command": "add", "description": "개인 할일 추가"} in commands
+    assert {"command": "task", "description": "할일 상세 보기"} in commands
+    assert {"command": "done", "description": "개인 할일 완료 처리"} in commands
     assert {"command": "inbox", "description": "임시 draft 목록 보기"} not in commands
     assert {"command": "apply", "description": "inbox draft 반영하기"} not in commands
     assert first["menu"]["updated"] is True
@@ -258,7 +261,7 @@ def test_sync_telegram_allows_start_for_unapproved_chat(
     assert "[KU] 시작 안내" in sent_messages[0][1]
     assert "할 수 있는 일" in sent_messages[0][1]
     assert "- /connect" not in sent_messages[0][1]
-    assert "- /assignments : 내야 할 과제" in sent_messages[0][1]
+    assert "- /todo : 개인 할일 + LMS 과제" in sent_messages[0][1]
     assert "/connect 연세대학교" not in sent_messages[0][1]
     assert "자연어 리마인더 예약" not in sent_messages[0][1]
     assert "아직 사용할 수 있도록 활성화되지 않았습니다" in sent_messages[0][1]
@@ -4347,7 +4350,7 @@ def test_sync_telegram_apply_command_is_removed(
     assert inbox_items[0].external_id == "telegram:draft:1"
 
 
-def test_sync_telegram_done_command_is_removed(
+def test_sync_telegram_done_selector_form_does_not_update_lms_task(
     tmp_path: Path, monkeypatch
 ) -> None:
     db = Database(tmp_path / "ku.db")
@@ -4397,9 +4400,9 @@ def test_sync_telegram_done_command_is_removed(
     result = pipeline.sync_telegram(settings=settings, db=db)
 
     assert result["commands"]["processed"] == 1
-    assert result["commands"]["failed"] == 1
+    assert result["commands"]["failed"] == 0
     assert len(sent_messages) == 1
-    assert sent_messages[0] == ("12345", "unsupported command: /done")
+    assert sent_messages[0] == ("12345", "사용법: /done <번호>")
     task = db.get_task_for_selector("uclass:task:done-1")
     assert task is not None
     assert task["status"] == "open"

@@ -103,8 +103,20 @@ def test_format_network_error_surfaces_message(monkeypatch):
 
 def test_parse_assignments_aliases():
     expected = {"command": "assignments", "ok": True}
-    for cmd in ("/assignments", "/due", "/homework", "/todo", "/to_submit", "/과제", "/제출할거", "/해야할거"):
+    for cmd in ("/assignments", "/due", "/homework", "/to_submit", "/과제", "/제출할거", "/해야할거"):
         assert telegram.parse_command_message(cmd) == expected, cmd
+
+
+def test_parse_todo_commands():
+    assert telegram.parse_command_message("/todo") == {"command": "todo", "ok": True}
+    assert telegram.parse_command_message("/todo 새로고침") == {"command": "todo", "ok": True, "refresh": True}
+    assert telegram.parse_command_message("/add 경제학 복습 04/30 22:00") == {
+        "command": "todo_add",
+        "ok": True,
+        "text": "경제학 복습 04/30 22:00",
+    }
+    assert telegram.parse_command_message("/task 2") == {"command": "todo_detail", "ok": True, "index": "2"}
+    assert telegram.parse_command_message("/done 2") == {"command": "todo_done", "ok": True, "index": "2"}
 
 
 def test_parse_assignment_refresh_detail_and_week():
@@ -381,6 +393,115 @@ def test_format_assignment_detail_and_week_use_assignments_cache(monkeypatch, tm
     assert "근거" in detail
     assert "[KU] 이번 주 마감" in week
     assert "- 1. 보고서 안내" in week
+
+
+def test_format_todo_combines_personal_tasks_and_lms_assignments(monkeypatch, tmp_path):
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    db.upsert_task(
+        external_id="personal:test-1",
+        source="personal",
+        due_at="2026-04-27T13:00:00+09:00",
+        title="운영체제 복습",
+        status="open",
+        metadata_json={"original_text": "운영체제 복습 오늘 13:00"},
+        user_id=7,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_telegram_assignments_cached_payload_for_user",
+        lambda **_kwargs: {
+            "items": [
+                {
+                    "index": 4,
+                    "title": "중간고사 대체 과제",
+                    "course_name": "사이버기술과법 00분반",
+                    "due_at": "2026-04-30T14:59:00+09:00",
+                    "source_label": "과제",
+                    "evidence": "보고서 제출",
+                    "type": "course_assignment",
+                }
+            ]
+        },
+    )
+
+    out = pipeline._format_telegram_todo(
+        settings=SimpleNamespace(timezone="Asia/Seoul"),
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    detail = pipeline._format_telegram_todo_detail(
+        index="2",
+        settings=SimpleNamespace(timezone="Asia/Seoul"),
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+
+    assert "[KU] 할일" in out
+    assert "1. [개인] 운영체제 복습" in out
+    assert "2. [사이버기술과법 00분반] 중간고사 대체 과제" in out
+    assert "개인 완료: /done <번호>" in out
+    assert "[KU] 할일 상세 #2" in detail
+    assert "LMS 상세: /assignment 4" in detail
+
+
+def test_add_and_done_personal_todo_only_marks_personal_items(monkeypatch, tmp_path):
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    settings = SimpleNamespace(timezone="Asia/Seoul")
+    monkeypatch.setattr(
+        pipeline,
+        "_telegram_assignments_cached_payload_for_user",
+        lambda **_kwargs: {
+            "items": [
+                {
+                    "index": 1,
+                    "title": "LMS 과제",
+                    "course_name": "경제원론II 05분반",
+                    "due_at": "2026-04-30T14:59:00+09:00",
+                    "source_label": "과제",
+                }
+            ]
+        },
+    )
+
+    added = pipeline._format_telegram_add_personal_todo(
+        text="경제학 복습 04/30 22:00",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    listing = pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    lms_reject = pipeline._format_telegram_done_personal_todo(
+        index="1",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    personal_done = pipeline._format_telegram_done_personal_todo(
+        index="2",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    tasks = db.list_open_tasks(user_id=7)
+
+    assert "[KU] 개인 할일 추가" in added
+    assert "마감 04/30 22:00" in added
+    assert "1. [경제원론II 05분반] LMS 과제" in listing
+    assert "2. [개인] 경제학 복습" in listing
+    assert "LMS 과제는 수동 완료 처리하지 않습니다" in lms_reject
+    assert "[KU] 개인 할일 완료" in personal_done
+    assert not [task for task in tasks if task.source == "personal"]
 
 
 def test_parse_board_aliases():

@@ -327,15 +327,21 @@ Telegram 연동은 `getUpdates` 기반이다. 처리 순서는 다음과 같다.
 - `/status`
 - `/today`
 - `/tomorrow`
-- `/weather` 또는 `/todayweather`
+- `/todo`
+- `/add <내용>`
+- `/task <번호>`
+- `/done <번호>`
+- `/assignments`
+- `/assignment <번호>`
+- `/week`
+- `/submitted`
+- `/board`
+- `/materials`
 - `/todaysummary`
 - `/tomorrowsummary`
 - `/notice_uclass`
 - `/notice_general`
 - `/notice_academic`
-- `/inbox`
-- `/apply <id|all>`
-- `/done task <id|external_id>`
 - `/plan <자연어 문장>`
 
 허용 chat ID에 없는 채팅은 `/start`, `/help`, `/setup`만 통과시키고 나머지는 차단한다.
