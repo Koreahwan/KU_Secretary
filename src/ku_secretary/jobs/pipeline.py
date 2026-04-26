@@ -9333,7 +9333,7 @@ def _format_telegram_assignments(
         assignment_scan_failures += 1
     course_ids: list[int] = []
     course_name_by_id: dict[int, str] = {}
-    for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+    for course in _lms_scannable_courses(courses)[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
         if not isinstance(course, dict):
             continue
         cid, course_name = _lms_course_id_and_name(course)
@@ -9703,7 +9703,7 @@ def _format_telegram_submitted_assignments(
     rows: list[dict[str, Any]] = []
     scanned_courses = 0
     failures = 0
-    for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+    for course in _lms_scannable_courses(courses)[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
         if not isinstance(course, dict):
             continue
         cid, course_name = _lms_course_id_and_name(course)
@@ -9801,6 +9801,32 @@ def _lms_course_id_and_name(course: dict[str, Any]) -> tuple[int | None, str]:
         or (f"course {cid}" if cid is not None else "강의")
     )
     return cid, name
+
+
+def _lms_course_is_scannable(course: dict[str, Any]) -> bool:
+    if bool(course.get("access_restricted_by_date")):
+        return False
+    cid, name = _lms_course_id_and_name(course)
+    if cid is None:
+        return False
+    # Canvas may return old/restricted shell courses with only an id. Those
+    # 401 on course detail endpoints, so exclude them from live scans.
+    if str(name).strip() == str(cid):
+        return False
+    workflow_state = str(course.get("workflow_state") or "").strip().lower()
+    if workflow_state and workflow_state not in {"available", "completed", "created"}:
+        return False
+    return True
+
+
+def _lms_scannable_courses(courses: Any) -> list[dict[str, Any]]:
+    if not isinstance(courses, list):
+        return []
+    return [
+        course
+        for course in courses
+        if isinstance(course, dict) and _lms_course_is_scannable(course)
+    ]
 
 
 def _lms_board_posts_from_response(response: Any) -> list[dict[str, Any]]:
@@ -9983,7 +10009,7 @@ def _format_telegram_lms_board(
 
     course_ids: list[int] = []
     course_name: dict[int, str] = {}
-    for c in courses:
+    for c in _lms_scannable_courses(courses):
         cid, nm = _lms_course_id_and_name(c)
         if cid is None:
             continue
@@ -10107,7 +10133,7 @@ def _format_telegram_lms_materials(
     board_failures = 0
     rendered_any = False
 
-    for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+    for course in _lms_scannable_courses(courses)[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
         if not isinstance(course, dict):
             continue
         cid, course_name = _lms_course_id_and_name(course)

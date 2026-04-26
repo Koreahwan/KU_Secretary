@@ -329,6 +329,39 @@ def test_format_assignments_scans_each_course(monkeypatch):
     assert "  사이버기술과법 | 마감 04/30 23:00" in out
 
 
+def test_format_assignments_skips_restricted_shell_courses(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    calls: list[int] = []
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
+    monkeypatch.setattr(
+        ku_lms,
+        "get_courses",
+        lambda s: [
+            {"id": 72368, "access_restricted_by_date": True},
+            {"id": 11, "name": "사이버기술과법"},
+        ],
+    )
+
+    def fake_assignments(s, course_id, *, upcoming_only=False):
+        calls.append(course_id)
+        return []
+
+    monkeypatch.setattr(ku_lms, "get_assignments", fake_assignments)
+    monkeypatch.setattr(ku_lms, "get_announcements", lambda s, course_ids: [])
+    monkeypatch.setattr(ku_lms, "get_modules", lambda s, course_id, *, include_items=True: [])
+    monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [])
+
+    out = pipeline._format_telegram_assignments()
+    assert calls == [11]
+    assert "확인: 1개 과목의 과제/공지/자료/게시판을 직접 확인했습니다." in out
+    assert "일부 조회 실패" not in out
+
+
 def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch):
     monkeypatch.setenv("KU_PORTAL_ID", "uid")
     monkeypatch.setenv("KU_PORTAL_PW", "pw")
