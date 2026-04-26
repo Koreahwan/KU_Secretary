@@ -63,6 +63,9 @@ def test_sync_telegram_registers_bot_menu_commands(
     assert {"command": "todaysummary", "description": "오늘 수업 자료 요약 보기"} in commands
     assert {"command": "tomorrowsummary", "description": "내일 수업 자료 요약 보기"} in commands
     assert {"command": "notice_uclass", "description": "온라인강의실 최근 알림 보기"} in commands
+    assert {"command": "start", "description": "시작 안내"} not in commands
+    assert {"command": "setup", "description": "연결 상태 점검"} not in commands
+    assert {"command": "connect", "description": "학교 계정 연결"} not in commands
     assert {"command": "plan", "description": "자연어 리마인더 예약"} not in commands
     assert first["menu"]["updated"] is True
     assert second["menu"]["updated"] is False
@@ -251,7 +254,8 @@ def test_sync_telegram_allows_start_for_unapproved_chat(
     assert sent_messages[0][0] == "77777"
     assert "[KU] 시작 안내" in sent_messages[0][1]
     assert "할 수 있는 일" in sent_messages[0][1]
-    assert "- /connect" in sent_messages[0][1]
+    assert "- /connect" not in sent_messages[0][1]
+    assert "- /assignments : 내야 할 과제" in sent_messages[0][1]
     assert "/connect 연세대학교" not in sent_messages[0][1]
     assert "자연어 리마인더 예약" not in sent_messages[0][1]
     assert "아직 사용할 수 있도록 활성화되지 않았습니다" in sent_messages[0][1]
@@ -273,6 +277,8 @@ def test_format_telegram_help_and_start_expose_only_bot_for_assistant(
     start_message = pipeline._format_telegram_start(settings, db=db, chat_id="12345", user_id=None)
 
     assert "/bot <자연어>" in help_message
+    assert "/connect" not in help_message
+    assert "/setup" not in help_message
     assert "/assistant" not in help_message
     assert "/asis" not in help_message
     assert "/bot 오늘 일정이랑 날씨 알려줘" in start_message

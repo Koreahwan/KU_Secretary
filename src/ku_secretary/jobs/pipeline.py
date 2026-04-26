@@ -11244,11 +11244,8 @@ def _issue_moodle_connect_link(
 
 def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
     commands = [
-        {"command": "start", "description": "시작 안내"},
         {"command": "help", "description": "사용 가능한 명령 보기"},
         {"command": "bot", "description": "자연어 비서"},
-        {"command": "setup", "description": "연결 상태 점검"},
-        {"command": "connect", "description": "학교 계정 연결"},
         {"command": "status", "description": "동기화 상태 보기"},
         {"command": "today", "description": "오늘 일정과 마감 보기"},
         {"command": "tomorrow", "description": "내일 일정과 마감 보기"},
@@ -11371,7 +11368,6 @@ def _format_telegram_help(settings: Settings) -> str:
         "[KU] 도움말",
         "",
         "기본 명령",
-        "- /connect : 학교 계정 연결",
         "- /today : 오늘 일정과 마감 과제",
         "- /tomorrow : 내일 일정과 마감 과제",
         "- /weather : 오늘/내일 날씨",
@@ -11394,9 +11390,6 @@ def _format_telegram_help(settings: Settings) -> str:
         "관리 명령",
         "- /inbox : 임시 draft 목록",
         "- /apply <id|all> : inbox draft 반영",
-        "",
-        "시작",
-        "- 처음 사용이면 /connect 또는 /setup",
     ]
     lines.extend(
         [
@@ -11422,7 +11415,6 @@ def _format_telegram_start(
         "[KU] 시작 안내",
         "",
         "할 수 있는 일",
-        "- 학교 계정 연결",
         "- 자연어 비서",
         "- 고려대 공식 시간표 동기화",
         "- 아침/저녁 브리핑",
@@ -11441,9 +11433,11 @@ def _format_telegram_start(
             "- 고려대학교",
             "- 다른 학교는 일부 연결 정보만 확인될 수 있습니다.",
             "",
-            "바로 시작",
-            "- /connect",
-            "- 링크를 열어 학교를 선택한 뒤 학교 계정으로 로그인하세요.",
+            "주요 명령",
+            "- /assignments : 내야 할 과제",
+            "- /submitted : 제출 완료 과제",
+            "- /today : 오늘 일정",
+            "- /board : 과목별 공지/게시판",
         ]
     )
     if bool(getattr(settings, "telegram_assistant_enabled", False)):
@@ -11458,7 +11452,7 @@ def _format_telegram_start(
                 "",
                 "확인할 것",
                 "- 이 채팅은 아직 사용할 수 있도록 활성화되지 않았습니다.",
-                "- `/setup`으로 연결 상태를 확인하세요.",
+                "- 관리자에게 Telegram 채팅 허용 상태를 확인하세요.",
             ]
         )
     return "\n".join(lines)
