@@ -642,6 +642,59 @@ def test_todo_number_cache_survives_past_assignment_cache_ttl(monkeypatch, tmp_p
     assert "번호 캐시 유지 확인" in detail
 
 
+def test_task_update_command_can_complete_or_delete_personal_todos(monkeypatch, tmp_path):
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    settings = SimpleNamespace(timezone="Asia/Seoul")
+    monkeypatch.setattr(pipeline, "_telegram_assignments_cached_payload_for_user", lambda **_kwargs: {"items": []})
+    db.upsert_task(
+        external_id="personal:complete-via-task",
+        source="personal",
+        due_at="2026-04-29T23:59:00+09:00",
+        title="완료 테스트",
+        status="open",
+        metadata_json={},
+        user_id=7,
+    )
+    db.upsert_task(
+        external_id="personal:delete-via-task",
+        source="personal",
+        due_at="2026-04-30T23:59:00+09:00",
+        title="삭제 테스트",
+        status="open",
+        metadata_json={},
+        user_id=7,
+    )
+
+    pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    done = pipeline._format_telegram_update_personal_todo(
+        index="1",
+        text="완료",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    deleted = pipeline._format_telegram_update_personal_todo(
+        index="1",
+        text="삭제",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+
+    complete_task = db.get_task_for_selector("personal:complete-via-task", user_id=7)
+    delete_task = db.get_task_for_selector("personal:delete-via-task", user_id=7)
+    assert "[KU] 개인 할일 완료" in done
+    assert "[KU] 개인 할일 삭제" in deleted
+    assert complete_task and complete_task["status"] == "done"
+    assert delete_task and delete_task["status"] == "ignored"
+    assert not db.list_open_tasks(user_id=7)
+
+
 def test_parse_board_aliases():
     expected = {"command": "lms_board", "ok": True}
     for cmd in ("/board", "/lms_board", "/lmsboard", "/announcements", "/공지"):

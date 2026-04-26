@@ -10323,6 +10323,16 @@ def _parse_personal_todo_update_text(
     return title or title_fallback, str(current_due_at or "").strip() or None
 
 
+def _todo_update_action(text: Any) -> str | None:
+    body = re.sub(r"\s+", " ", str(text or "").strip()).lower()
+    compact = re.sub(r"\s+", "", body)
+    if compact in {"완료", "끝", "끝냄", "했음", "완료처리", "done", "complete", "completed"}:
+        return "done"
+    if compact in {"삭제", "제거", "지워", "지우기", "없애", "취소", "delete", "del", "remove"}:
+        return "ignore"
+    return None
+
+
 def _personal_todo_external_id(
     *,
     user_id: int | None,
@@ -10573,6 +10583,7 @@ def _format_telegram_todo(
             "",
             "상세: /task <번호>",
             "수정: /task <번호> <새 내용>",
+            "완료/삭제: /task <번호> 완료, /task <번호> 삭제",
             "개인 할일 추가: /add <내용>",
             "개인 완료: /done <번호>",
         ]
@@ -10640,7 +10651,14 @@ def _format_telegram_todo_detail(
         original_text = _truncate_lms_text(item.get("original_text") or "", 500)
         if original_text and original_text != str(item.get("title") or "").strip():
             lines.extend(["", "입력", original_text])
-        lines.extend(["", f"수정: /task {target_index} <새 내용>", f"완료: /done {target_index}"])
+        lines.extend(
+            [
+                "",
+                f"수정: /task {target_index} <새 내용>",
+                f"완료: /task {target_index} 완료",
+                f"삭제: /task {target_index} 삭제",
+            ]
+        )
     else:
         evidence = _truncate_lms_text(item.get("evidence") or "", 700)
         if evidence:
@@ -10733,12 +10751,40 @@ def _format_telegram_update_personal_todo(
     )
     if item is None:
         return f"{target_index}번 할일을 찾지 못했습니다. /todo 에 표시된 번호를 사용하세요."
+    action = _todo_update_action(new_text)
+    if action == "done":
+        return _format_telegram_done_personal_todo(
+            index=target_index,
+            settings=settings,
+            db=db,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
     if item.get("kind") != "personal":
         return "LMS 과제는 직접 수정하지 않습니다. LMS에서 읽은 제출/마감 정보를 그대로 보여줍니다."
     selector = str(item.get("task_selector") or "").strip()
     current = db.get_task_for_selector(selector, user_id=user_id)
     if current is None or str(current.get("source") or "").strip().lower() != "personal":
         return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
+    if action == "ignore":
+        updated = db.update_task_status(selector, "ignored", user_id=user_id)
+        if updated is None:
+            return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
+        _refresh_telegram_todo_cache(
+            db,
+            settings=settings,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        return "\n".join(
+            [
+                "[KU] 개인 할일 삭제",
+                "",
+                str(updated.get("title") or item.get("title") or "할일"),
+                "",
+                "확인: /todo",
+            ]
+        )
     timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
     title, due_at = _parse_personal_todo_update_text(
         new_text,
@@ -12325,6 +12371,7 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /add <내용> : 개인 할일 추가 (예: /add 운영체제 복습 내일 22:00)",
         "- /task <번호> : /todo 항목 상세 보기",
         "- /task <번호> <새 내용> : 개인 할일 수정",
+        "- /task <번호> 완료|삭제 : 개인 할일 완료 또는 삭제",
         "- /done <번호> : 개인 할일 완료 처리",
         "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목만 보기",
         "- /assignment <번호> : /assignments 항목 상세 보기",
