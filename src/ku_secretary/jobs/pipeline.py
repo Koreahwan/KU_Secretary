@@ -160,6 +160,7 @@ TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT = 20
 TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE = 5
 TELEGRAM_LMS_MESSAGE_SOFT_LIMIT = 3600
 TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS = 180
+TELEGRAM_TODO_CACHE_TTL_SECONDS = 6 * 60 * 60
 TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX = "telegram_assignments_cache"
 TELEGRAM_TODO_CACHE_JOB_PREFIX = "telegram_todo_cache"
 TELEGRAM_ASSIGNMENT_WEEK_LOOKAHEAD_DAYS = 7
@@ -9333,6 +9334,7 @@ def _get_cached_telegram_assignments_payload(
     job_name: str,
     user_id: int | None,
     now: datetime,
+    ttl_seconds: int = TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS,
 ) -> dict[str, Any] | None:
     if db is None:
         return None
@@ -9346,7 +9348,7 @@ def _get_cached_telegram_assignments_payload(
     if not message or generated_at is None:
         return None
     age = (now.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc)).total_seconds()
-    if age < 0 or age > TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS:
+    if age < 0 or age > ttl_seconds:
         return None
     return payload
 
@@ -9357,12 +9359,14 @@ def _get_cached_telegram_assignments(
     job_name: str,
     user_id: int | None,
     now: datetime,
+    ttl_seconds: int = TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS,
 ) -> str | None:
     payload = _get_cached_telegram_assignments_payload(
         db,
         job_name=job_name,
         user_id=user_id,
         now=now,
+        ttl_seconds=ttl_seconds,
     )
     return str(payload.get("message") or "").strip() if payload else None
 
@@ -9375,6 +9379,7 @@ def _store_cached_telegram_assignments(
     message: str,
     generated_at: datetime,
     items: list[dict[str, Any]] | None = None,
+    ttl_seconds: int = TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS,
 ) -> None:
     if db is None or not str(message or "").strip():
         return
@@ -9384,7 +9389,7 @@ def _store_cached_telegram_assignments(
             last_run_at=generated_at.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
             last_cursor_json={
                 "generated_at": generated_at.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
-                "ttl_seconds": TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS,
+                "ttl_seconds": ttl_seconds,
                 "message": message,
                 "items": items or [],
             },
@@ -9999,6 +10004,7 @@ def _telegram_assignments_cached_payload_for_user(
         job_name=job_name,
         user_id=user_id,
         now=now,
+        ttl_seconds=TELEGRAM_TODO_CACHE_TTL_SECONDS,
     )
     if payload is not None or not allow_refresh:
         return payload
@@ -10366,6 +10372,7 @@ def _telegram_todo_cached_payload_for_user(
         job_name=job_name,
         user_id=user_id,
         now=now,
+        ttl_seconds=TELEGRAM_TODO_CACHE_TTL_SECONDS,
     )
     if payload is not None or not allow_refresh:
         return payload
@@ -10381,22 +10388,30 @@ def _telegram_todo_cached_payload_for_user(
         job_name=job_name,
         user_id=user_id,
         now=datetime.now(timezone.utc),
+        ttl_seconds=TELEGRAM_TODO_CACHE_TTL_SECONDS,
     )
 
 
-def _clear_telegram_todo_cache(
+def _refresh_telegram_todo_cache(
     db: Database | None,
     *,
+    settings: Settings | None,
     user_id: int | None,
     chat_id: str | int | None,
 ) -> None:
     if db is None:
         return
-    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
     try:
-        db.update_sync_state(job_name, last_run_at=None, last_cursor_json={}, user_id=user_id)
+        _format_telegram_todo(
+            settings=settings,
+            db=db,
+            user_id=user_id,
+            chat_id=chat_id,
+            force_refresh=True,
+            refresh_lms=False,
+        )
     except Exception:
-        logger.debug("failed to clear telegram todo cache", exc_info=True)
+        logger.debug("failed to refresh telegram todo cache", exc_info=True)
 
 
 def _format_telegram_todo(
@@ -10406,6 +10421,7 @@ def _format_telegram_todo(
     user_id: int | None = None,
     chat_id: str | int | None = None,
     force_refresh: bool = False,
+    refresh_lms: bool = True,
 ) -> str:
     timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
     local_tz = ZoneInfo(timezone_name)
@@ -10417,6 +10433,7 @@ def _format_telegram_todo(
             job_name=cache_job_name,
             user_id=user_id,
             now=cache_now,
+            ttl_seconds=TELEGRAM_TODO_CACHE_TTL_SECONDS,
         )
         if cached_message is not None:
             return cached_message
@@ -10439,7 +10456,7 @@ def _format_telegram_todo(
                 )
             )
 
-    if force_refresh:
+    if force_refresh and refresh_lms:
         _format_telegram_assignments(
             settings=settings,
             db=db,
@@ -10452,7 +10469,7 @@ def _format_telegram_todo(
         db=db,
         user_id=user_id,
         chat_id=chat_id,
-        allow_refresh=True,
+        allow_refresh=refresh_lms,
     )
     raw_lms_items = assignment_payload.get("items") if isinstance(assignment_payload, dict) else []
     lms_items: list[dict[str, Any]] = []
@@ -10505,6 +10522,7 @@ def _format_telegram_todo(
             message=message,
             generated_at=cache_now,
             items=[],
+            ttl_seconds=TELEGRAM_TODO_CACHE_TTL_SECONDS,
         )
         return message
 
@@ -10568,6 +10586,7 @@ def _format_telegram_todo(
         message=message,
         generated_at=cache_now,
         items=cache_items,
+        ttl_seconds=TELEGRAM_TODO_CACHE_TTL_SECONDS,
     )
     return message
 
@@ -10667,7 +10686,12 @@ def _format_telegram_add_personal_todo(
         },
         user_id=user_id,
     )
-    _clear_telegram_todo_cache(db, user_id=user_id, chat_id=chat_id)
+    _refresh_telegram_todo_cache(
+        db,
+        settings=settings,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
     lines = ["[KU] 개인 할일 추가", "", title]
     if due_at:
         lines.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
@@ -10742,7 +10766,12 @@ def _format_telegram_update_personal_todo(
         metadata_json=metadata,
         user_id=user_id,
     )
-    _clear_telegram_todo_cache(db, user_id=user_id, chat_id=chat_id)
+    _refresh_telegram_todo_cache(
+        db,
+        settings=settings,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
     lines = ["[KU] 개인 할일 수정", "", updated.title]
     if updated.due_at:
         lines.append(f"마감 {_format_lms_list_dt(updated.due_at, timezone_name=timezone_name)}")
@@ -10789,7 +10818,12 @@ def _format_telegram_done_personal_todo(
     updated = db.update_task_status(selector, "done", user_id=user_id)
     if updated is None:
         return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
-    _clear_telegram_todo_cache(db, user_id=user_id, chat_id=chat_id)
+    _refresh_telegram_todo_cache(
+        db,
+        settings=settings,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
     return "\n".join(["[KU] 개인 할일 완료", "", str(updated.get("title") or item.get("title") or "할일"), "", "확인: /todo"])
 
 

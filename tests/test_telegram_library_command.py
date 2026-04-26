@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -501,7 +503,13 @@ def test_add_update_and_done_personal_todo_only_marks_personal_items(monkeypatch
         user_id=7,
         chat_id="123",
     )
-    listing_after_update = pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    detail_after_update = pipeline._format_telegram_todo_detail(
+        index="2",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
     lms_reject = pipeline._format_telegram_done_personal_todo(
         index="1",
         settings=settings,
@@ -526,7 +534,9 @@ def test_add_update_and_done_personal_todo_only_marks_personal_items(monkeypatch
     assert "[KU] 개인 할일 수정" in personal_update
     assert "경제학 문제풀이" in personal_update
     assert "마감 05/01 21:30" in personal_update
-    assert "2. [개인] 경제학 문제풀이" in listing_after_update
+    assert "[KU] 할일 상세 #2" in detail_after_update
+    assert "경제학 문제풀이" in detail_after_update
+    assert "마감 05/01 21:30" in detail_after_update
     assert "LMS 과제는 수동 완료 처리하지 않습니다" in lms_reject
     assert "[KU] 개인 할일 완료" in personal_done
     assert not [task for task in tasks if task.source == "personal"]
@@ -599,6 +609,37 @@ def test_update_personal_todo_full_text_preserves_korean_particles(monkeypatch, 
     assert "대중문화로보는일본문화론 발표(정원)" in updated
     assert "대중문화 보 일본문화론" not in updated
     assert "마감 04/29 23:59" in updated
+
+
+def test_todo_number_cache_survives_past_assignment_cache_ttl(monkeypatch, tmp_path):
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    settings = SimpleNamespace(timezone="Asia/Seoul")
+    db.upsert_task(
+        external_id="personal:long-cache",
+        source="personal",
+        due_at="2026-04-29T23:59:00+09:00",
+        title="번호 캐시 유지 확인",
+        status="open",
+        metadata_json={"original_text": "번호 캐시 유지 확인"},
+        user_id=7,
+    )
+    monkeypatch.setattr(pipeline, "_telegram_assignments_cached_payload_for_user", lambda **_kwargs: {"items": []})
+
+    pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    job_name = pipeline._telegram_todo_cache_job_name(user_id=7, chat_id="123")
+    state = db.get_sync_state(job_name, user_id=7)
+    payload = json.loads(state.last_cursor_json or "{}")
+    old_generated_at = (datetime.now(timezone.utc) - timedelta(minutes=10)).replace(microsecond=0).isoformat()
+    payload["generated_at"] = old_generated_at
+    db.update_sync_state(job_name, last_run_at=old_generated_at, last_cursor_json=payload, user_id=7)
+
+    detail = pipeline._format_telegram_todo_detail(index="1", settings=settings, db=db, user_id=7, chat_id="123")
+
+    assert "[KU] 할일 상세 #1" in detail
+    assert "번호 캐시 유지 확인" in detail
 
 
 def test_parse_board_aliases():
