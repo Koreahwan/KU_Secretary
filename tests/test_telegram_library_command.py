@@ -147,7 +147,7 @@ def test_format_assignments_renders_todo_and_events(monkeypatch):
     assert "중간고사 대체 과제" in out
     assert "04/26 23:59" in out
     assert "과제" in out
-    assert "이벤트" in out
+    assert "이벤트" not in out
 
 
 def test_format_assignments_empty(monkeypatch):
@@ -296,6 +296,38 @@ def test_format_assignments_reads_settings_dotenv(monkeypatch, tmp_path):
     assert seen == {"login": "student-id:student-pw"}
 
 
+def test_format_assignments_uses_short_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    calls = {"login": 0}
+
+    def fake_login(*, user_id, password):
+        calls["login"] += 1
+        return "s"
+
+    monkeypatch.setattr(ku_lms, "login", fake_login)
+    monkeypatch.setattr(
+        ku_lms,
+        "get_todo",
+        lambda s: [{"assignment": {"name": "캐시 과제", "due_at": "2026-04-30T14:59:00Z"}}],
+    )
+    monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [])
+
+    first = pipeline._format_telegram_assignments(db=db, user_id=7, chat_id="123")
+    monkeypatch.setattr(ku_lms, "login", lambda **kwargs: pytest.fail("cache should skip login"))
+    second = pipeline._format_telegram_assignments(db=db, user_id=7, chat_id="123")
+
+    assert "캐시 과제" in first
+    assert second == first
+    assert calls["login"] == 1
+
+
 def test_parse_board_aliases():
     expected = {"command": "lms_board", "ok": True}
     for cmd in ("/board", "/lms_board", "/lmsboard", "/announcements", "/공지"):
@@ -387,6 +419,11 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
                 "context_code": "course_11",
                 "title": "보고서 제출 안내",
                 "message": "보고서 과제는 2026-05-01 23:59까지 제출하세요.",
+            },
+            {
+                "context_code": "course_11",
+                "title": "HW#1 공지",
+                "message": "개선된 code와 ppt를 제출 바랍니다. 제출 마감: 2025.5.3 오후 7시까지",
             }
         ],
     )
@@ -423,6 +460,8 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
     assert "중간고사 과제 우수자 발표 안내" not in out
     assert "[사이버기술과법]" in out
     assert "  공지 | 마감 05/01 23:59" in out
+    assert "- HW#1 공지" in out
+    assert "  공지 | 마감 05/03 19:00" in out
     assert "  모듈/자료 | 마감 05/02 18:00" in out
     assert "  게시판 자료실 | 마감 05/03 12:00" in out
     assert "확인: 1개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다." in out

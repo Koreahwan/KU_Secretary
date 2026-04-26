@@ -159,6 +159,8 @@ TELEGRAM_LMS_ASSIGNMENT_BOARD_DETAIL_LIMIT_PER_BOARD = 3
 TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT = 20
 TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE = 5
 TELEGRAM_LMS_MESSAGE_SOFT_LIMIT = 3600
+TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS = 180
+TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX = "telegram_assignments_cache"
 PORTAL_SECURE_STORAGE_MISSING_REASON = "KU portal session missing from secure storage; reconnect required"
 UCLASS_SECURE_STORAGE_MISSING_REASON = "UClass token missing from secure storage; reconnect required"
 UCLASS_RECONNECT_REQUIRED_REASON = "UClass token expired or unavailable; reconnect required"
@@ -9308,6 +9310,70 @@ class _TelegramAssignmentHint:
     evidence: str
 
 
+def _telegram_assignments_cache_job_name(
+    *,
+    login_id: str,
+    user_id: int | None,
+    chat_id: str | int | None,
+) -> str:
+    payload = {
+        "login_id_hash": sha1(str(login_id or "").encode("utf-8")).hexdigest(),
+        "user_id": _safe_int(user_id),
+        "chat_id": str(chat_id or "").strip() or None,
+    }
+    digest = sha1(json.dumps(payload, ensure_ascii=True, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"{TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX}:{digest}"
+
+
+def _get_cached_telegram_assignments(
+    db: Database | None,
+    *,
+    job_name: str,
+    user_id: int | None,
+    now: datetime,
+) -> str | None:
+    if db is None:
+        return None
+    try:
+        state = db.get_sync_state(job_name, user_id=user_id)
+    except AttributeError:
+        return None
+    payload = _json_load(state.last_cursor_json)
+    message = str(payload.get("message") or "").strip()
+    generated_at = _parse_dt(str(payload.get("generated_at") or ""))
+    if not message or generated_at is None:
+        return None
+    age = (now.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc)).total_seconds()
+    if age < 0 or age > TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS:
+        return None
+    return message
+
+
+def _store_cached_telegram_assignments(
+    db: Database | None,
+    *,
+    job_name: str,
+    user_id: int | None,
+    message: str,
+    generated_at: datetime,
+) -> None:
+    if db is None or not str(message or "").strip():
+        return
+    try:
+        db.update_sync_state(
+            job_name,
+            last_run_at=generated_at.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+            last_cursor_json={
+                "generated_at": generated_at.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
+                "ttl_seconds": TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS,
+                "message": message,
+            },
+            user_id=user_id,
+        )
+    except Exception:
+        logger.debug("failed to store telegram assignments cache", exc_info=True)
+
+
 def _format_telegram_assignments(
     *,
     settings: Settings | None = None,
@@ -9330,6 +9396,20 @@ def _format_telegram_assignments(
     if credentials is None:
         return "KU_PORTAL_ID / KU_PORTAL_PW 환경변수가 비어 있습니다."
     login_id, password = credentials
+    cache_job_name = _telegram_assignments_cache_job_name(
+        login_id=login_id,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    cache_now = datetime.now(timezone.utc)
+    cached_message = _get_cached_telegram_assignments(
+        db,
+        job_name=cache_job_name,
+        user_id=user_id,
+        now=cache_now,
+    )
+    if cached_message is not None:
+        return cached_message
 
     try:
         session = ku_lms.login(user_id=login_id, password=password)
@@ -9345,6 +9425,8 @@ def _format_telegram_assignments(
         events = ku_lms.get_upcoming_events(session)
     except Exception:
         events = []
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    reference_local = datetime.now(ZoneInfo(timezone_name))
 
     def _pretty_dt(value: str | None) -> str:
         if not value:
@@ -9367,19 +9449,41 @@ def _format_telegram_assignments(
             ]
         )
 
+    def _assignment_event_key(title: Any, value: Any) -> tuple[str, str] | None:
+        title_key = _normalize_task_title_key(str(title or ""))
+        if not title_key:
+            return None
+        parsed = _parse_dt(str(value or ""))
+        if parsed is not None:
+            try:
+                local = parsed.astimezone(ZoneInfo(timezone_name))
+            except Exception:
+                local = parsed
+            return title_key, local.replace(second=0, microsecond=0).isoformat()
+        raw = str(value or "").strip()
+        return (title_key, raw) if raw else None
+
     seen_assignment_keys = {
         _assignment_key(item)
         for item in todos
         if isinstance(item, dict) and _assignment_key(item)
     }
+    assignment_event_keys: set[tuple[str, str]] = set()
+    for item in todos:
+        if not isinstance(item, dict):
+            continue
+        assignment = item.get("assignment") if isinstance(item.get("assignment"), dict) else {}
+        title = assignment.get("name") or item.get("title")
+        due_at = assignment.get("due_at") or item.get("due_at")
+        key = _assignment_event_key(title, due_at)
+        if key is not None:
+            assignment_event_keys.add(key)
     course_assignment_rows: list[dict[str, Any]] = []
     source_hint_rows: list[_TelegramAssignmentHint] = []
     seen_source_hint_keys: set[tuple[str, str, str, str]] = set()
     scanned_courses = 0
     assignment_scan_failures = 0
     source_scan_failures = 0
-    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
-    reference_local = datetime.now(ZoneInfo(timezone_name))
     try:
         courses = ku_lms.get_courses(session) or []
     except Exception:
@@ -9411,6 +9515,9 @@ def _format_telegram_assignments(
                 seen_assignment_keys.add(key)
             name = str(assignment.get("name") or assignment.get("title") or "(제목 없음)").strip()
             due_at = _pretty_dt(str(assignment.get("due_at") or ""))
+            event_key = _assignment_event_key(name, assignment.get("due_at") or due_at)
+            if event_key is not None:
+                assignment_event_keys.add(event_key)
             course_assignment_rows.append(
                 {
                     "course_id": cid,
@@ -9425,7 +9532,41 @@ def _format_telegram_assignments(
             if not _contains_submission_action_hints(hint.title, hint.evidence):
                 continue
             due_dt = _parse_dt(str(hint.due_at or ""))
-            if due_dt is None or due_dt.astimezone(reference_local.tzinfo) < reference_local:
+            if due_dt is None:
+                continue
+            local_tz = ZoneInfo(timezone_name)
+            due_local = due_dt.astimezone(local_tz)
+            if due_local < reference_local and due_local.year < reference_local.year:
+                corrected_dt = None
+                if hint.evidence:
+                    corrected_text = re.sub(
+                        rf"\b{due_local.year}\b",
+                        str(reference_local.year),
+                        hint.evidence,
+                        count=1,
+                    )
+                    corrected_due = _coerce_due_iso(
+                        corrected_text,
+                        timezone_name=timezone_name,
+                        reference_local=reference_local,
+                        default_end_of_day=True,
+                    )
+                    corrected_dt = _parse_dt(corrected_due)
+                corrected = (
+                    corrected_dt.astimezone(local_tz)
+                    if corrected_dt is not None
+                    else due_local.replace(year=reference_local.year)
+                )
+                if reference_local <= corrected <= reference_local + timedelta(days=180):
+                    hint = _TelegramAssignmentHint(
+                        course_name=hint.course_name,
+                        source_label=hint.source_label,
+                        title=hint.title,
+                        due_at=corrected.isoformat(),
+                        evidence=hint.evidence,
+                    )
+                    due_local = corrected
+            if due_local < reference_local:
                 continue
             key = (
                 _normalize_task_title_key(hint.course_name),
@@ -9437,6 +9578,9 @@ def _format_telegram_assignments(
                 continue
             seen_source_hint_keys.add(key)
             source_hint_rows.append(hint)
+            event_key = _assignment_event_key(hint.title, hint.due_at)
+            if event_key is not None:
+                assignment_event_keys.add(event_key)
 
     try:
         announcements = ku_lms.get_announcements(session, course_ids) if course_ids else []
@@ -9597,7 +9741,15 @@ def _format_telegram_assignments(
                 f"- 참고: 일부 조회 실패 과제 {assignment_scan_failures}건 / "
                 f"공지·자료·게시판 {source_scan_failures}건"
             )
-        return "\n".join(lines)
+        message = "\n".join(lines)
+        _store_cached_telegram_assignments(
+            db,
+            job_name=cache_job_name,
+            user_id=user_id,
+            message=message,
+            generated_at=cache_now,
+        )
+        return message
 
     lines = ["[KU] 내야 할 과제"]
     known_course_order = list(course_ids)
@@ -9652,6 +9804,9 @@ def _format_telegram_assignments(
             course_name = course_name_by_id.get(cid or -1, "다가오는 이벤트")
             title = (ev.get("title") or "(제목 없음)").strip()
             start = _pretty_dt(ev.get("start_at"))
+            event_key = _assignment_event_key(title, ev.get("start_at") or start)
+            if event_key is not None and event_key in assignment_event_keys:
+                continue
             ensure_course_group(cid, course_name)["events"].append({"title": title, "start_at": start})
 
     ordered_keys: list[int | str] = [cid for cid in known_course_order if cid in course_groups]
@@ -9682,10 +9837,9 @@ def _format_telegram_assignments(
         for hint in group["source_hints"]:
             if rendered_source_hints >= TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT:
                 continue
-            due_at = _pretty_dt(hint.due_at)
             details = [str(hint.source_label or "").strip()]
-            if due_at:
-                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+            if hint.due_at:
+                details.append(f"마감 {_format_lms_list_dt(hint.due_at, timezone_name=timezone_name)}")
             _append_lms_list_item(lines, title=hint.title, details=details)
             rendered_source_hints += 1
         if group["events"]:
@@ -9717,7 +9871,15 @@ def _format_telegram_assignments(
             f"공지·자료·게시판 {source_scan_failures}건"
         )
 
-    return "\n".join(lines)
+    message = "\n".join(lines)
+    _store_cached_telegram_assignments(
+        db,
+        job_name=cache_job_name,
+        user_id=user_id,
+        message=message,
+        generated_at=cache_now,
+    )
+    return message
 
 
 def _format_lms_list_dt(value: str | None, *, timezone_name: str = "Asia/Seoul") -> str:
@@ -10090,7 +10252,13 @@ def _telegram_assignment_hints_from_text(
         due_at = str(task.get("due_at") or "").strip()
         task_title = str(task.get("title") or title or "과제").strip()
         source_title = _clean_material_task_title(title)
-        if source_title and (len(task_title) > 80 or task_title.startswith("안녕하세요")):
+        if re.search(r"(?i)\bhw\s*#?\s*\d+", str(title or "")):
+            source_title = _truncate_lms_text(title, 80)
+        if source_title and (
+            len(task_title) > 80
+            or task_title.startswith("안녕하세요")
+            or task_title.startswith("#")
+        ):
             task_title = source_title
         if not due_at or not task_title:
             continue
