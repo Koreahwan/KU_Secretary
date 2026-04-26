@@ -1558,6 +1558,60 @@ def _contains_material_task_hints(*values: str) -> bool:
     return any(keyword in haystack for keyword in MATERIAL_TASK_HINT_KEYWORDS)
 
 
+def _contains_submission_action_hints(*values: str) -> bool:
+    haystack = " ".join(str(value or "") for value in values).lower()
+    title = str(values[0] if values else "")
+    submit_signals = (
+        "제출",
+        "작성",
+        "등록",
+        "첨부",
+        "내세요",
+        "내기",
+        "챙겨",
+        "submit",
+        "turn in",
+        "hand in",
+    )
+    deliverable_signals = (
+        "과제물",
+        "보고서",
+        "레포트",
+        "리포트",
+        "프로젝트",
+        "project",
+        "report",
+        "assignment",
+        "homework",
+        "quiz",
+        "퀴즈",
+        "hw",
+    )
+    deadline_signals = ("마감", "기한", "까지", "due", "deadline")
+    title_has_strong_signal = any(
+        signal in title.lower()
+        for signal in (*submit_signals, *deliverable_signals)
+    )
+    if any(noise in title for noise in ("우수자", "우수 자", "발표 안내")) and not title_has_strong_signal:
+        return False
+    if (
+        any(noise in haystack for noise in ("강의 업로드", "강의를 업로드", "업로드했", "업로드 했"))
+        and "제출" not in haystack
+        and "과제" not in haystack
+    ):
+        return False
+    if re.search(
+        r"(?:업로드|upload).{0,24}(?:제출|submit)|(?:제출|submit).{0,24}(?:업로드|upload)",
+        haystack,
+    ):
+        return True
+    if any(signal in haystack for signal in submit_signals):
+        return True
+    if any(signal in haystack for signal in deliverable_signals):
+        return True
+    return "과제" in haystack and any(signal in haystack for signal in deadline_signals)
+
+
 def _snippet_has_explicit_time(text: str) -> bool:
     snippet = str(text or "")
     return any(pattern.search(snippet) for pattern in MATERIAL_TIME_PATTERNS)
@@ -9361,6 +9415,11 @@ def _format_telegram_assignments(
 
     def add_source_hints(hints: list[_TelegramAssignmentHint]) -> None:
         for hint in hints:
+            if not _contains_submission_action_hints(hint.title, hint.evidence):
+                continue
+            due_dt = _parse_dt(str(hint.due_at or ""))
+            if due_dt is None or due_dt.astimezone(reference_local.tzinfo) < reference_local:
+                continue
             key = (
                 _normalize_task_title_key(hint.course_name),
                 _normalize_task_title_key(hint.title),
@@ -9525,7 +9584,7 @@ def _format_telegram_assignments(
     if not todos and not events and not course_assignment_rows and not source_hint_rows:
         lines = ["[KU] 내야 할 과제", "- 마감 임박한 과제가 없습니다."]
         if scanned_courses:
-            lines.append(f"- 확인: {scanned_courses}개 과목의 과제/공지/자료/게시판을 직접 확인했습니다.")
+            lines.append(f"- 확인: {scanned_courses}개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다.")
         if assignment_scan_failures or source_scan_failures:
             lines.append(
                 f"- 참고: 일부 조회 실패 과제 {assignment_scan_failures}건 / "
@@ -9561,7 +9620,7 @@ def _format_telegram_assignments(
 
     if source_hint_rows:
         lines.append("")
-        lines.append(f"공지/자료/게시판에서 감지 ({len(source_hint_rows)}건)")
+        lines.append(f"공지/자료/게시판의 제출 항목 ({len(source_hint_rows)}건)")
         for hint in source_hint_rows[:TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT]:
             due_at = _pretty_dt(hint.due_at)
             details = [_compact_lms_course_name(hint.course_name), str(hint.source_label or "").strip()]
@@ -9585,7 +9644,7 @@ def _format_telegram_assignments(
 
     if scanned_courses:
         lines.append("")
-        lines.append(f"확인: {scanned_courses}개 과목의 과제/공지/자료/게시판을 직접 확인했습니다.")
+        lines.append(f"확인: {scanned_courses}개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다.")
 
     if assignment_scan_failures or source_scan_failures:
         lines.append("")
@@ -9949,6 +10008,9 @@ def _telegram_assignment_hints_from_text(
     ):
         due_at = str(task.get("due_at") or "").strip()
         task_title = str(task.get("title") or title or "과제").strip()
+        source_title = _clean_material_task_title(title)
+        if source_title and (len(task_title) > 80 or task_title.startswith("안녕하세요")):
+            task_title = source_title
         if not due_at or not task_title:
             continue
         rows.append(
@@ -11071,7 +11133,7 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /notice_general : 학교 일반공지",
         "- /notice_academic : 학교 학사공지",
         "- /library [도서관명] : 도서관 좌석 현황 (예: /library 중앙도서관)",
-        "- /assignments : 제출해야 할 LMS 과제/공지/자료/게시판 감지 항목 (별칭: /due /todo /과제)",
+        "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목 (별칭: /due /todo /과제)",
         "- /submitted : 제출 완료 LMS 과제 (별칭: /submissions /제출완료)",
         "- /board : 과목별 LMS 공지/게시판 최근 글 (별칭: /announcements /공지)",
         "- /materials : 과목별 LMS 모듈/게시판 강의자료 위치 (별칭: /자료 /강의자료)",

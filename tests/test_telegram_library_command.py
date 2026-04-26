@@ -358,7 +358,7 @@ def test_format_assignments_skips_restricted_shell_courses(monkeypatch):
 
     out = pipeline._format_telegram_assignments()
     assert calls == [11]
-    assert "확인: 1개 과목의 과제/공지/자료/게시판을 직접 확인했습니다." in out
+    assert "확인: 1개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다." in out
     assert "일부 조회 실패" not in out
 
 
@@ -376,6 +376,11 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
         ku_lms,
         "get_announcements",
         lambda s, course_ids: [
+            {
+                "context_code": "course_11",
+                "title": "중간고사 과제 우수자 발표 안내",
+                "message": "중간고사 과제 우수자는 2026-05-01 발표 예정입니다.",
+            },
             {
                 "context_code": "course_11",
                 "title": "보고서 제출 안내",
@@ -412,11 +417,12 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
     )
 
     out = pipeline._format_telegram_assignments()
-    assert "공지/자료/게시판에서 감지" in out
+    assert "공지/자료/게시판의 제출 항목" in out
+    assert "중간고사 과제 우수자 발표 안내" not in out
     assert "  사이버기술과법 | 공지 | 마감 05/01 23:59" in out
     assert "  사이버기술과법 | 모듈/자료 | 마감 05/02 18:00" in out
     assert "  사이버기술과법 | 게시판 자료실 | 마감 05/03 12:00" in out
-    assert "확인: 1개 과목의 과제/공지/자료/게시판을 직접 확인했습니다." in out
+    assert "확인: 1개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다." in out
 
 
 def test_format_submitted_assignments_renders_submission_status(monkeypatch):
