@@ -17,8 +17,12 @@ EXACT_RUNTIME_FILE_REASONS = {
 EXCLUDED_DIR_NAMES = {
     ".codex",
     ".cache",
+    ".claude",
     ".git",
+    ".omc",
+    ".playwright-mcp",
     ".venv",
+    "_reference",
     "venv",
     "cache",
     ".pytest_cache",
@@ -245,6 +249,10 @@ def classify_path(relative_path: Path, *, is_dir: bool) -> str | None:
 def _reason_for_directory(name_lower: str) -> str:
     if name_lower == ".codex":
         return "local Codex environment metadata"
+    if name_lower in {".claude", ".omc", ".playwright-mcp"}:
+        return "local agent/browser state"
+    if name_lower == "_reference":
+        return "upstream reference clone"
     if name_lower == ".git":
         return "git metadata"
     if name_lower in {".venv", "venv"}:

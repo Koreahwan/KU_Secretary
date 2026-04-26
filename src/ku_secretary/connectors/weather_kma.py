@@ -11,7 +11,6 @@ import requests
 
 
 KMA_API_BASE = "https://apihub.kma.go.kr/api"
-KMA_SAMPLE_AUTH_KEY = "4_Juann2" "Raiybmp59" "uWoBQ"
 DEFAULT_TIMEOUT_SEC = 20
 DEFAULT_GEOCODER_TIMEOUT_SEC = 10
 NOMINATIM_SEARCH_URL = "https://nominatim.openstreetmap.org/search"
@@ -225,13 +224,15 @@ class KMAWeatherClient:
         timeout_sec: int = DEFAULT_TIMEOUT_SEC,
         session: requests.sessions.Session | None = None,
     ) -> None:
-        self.auth_key = str(auth_key or KMA_SAMPLE_AUTH_KEY).strip() or KMA_SAMPLE_AUTH_KEY
+        self.auth_key = str(auth_key or "").strip()
         self.api_base = str(api_base or KMA_API_BASE).rstrip("/")
         self.timeout_sec = max(int(timeout_sec), 1)
         self.session = session or requests.Session()
         self._grid_cache: dict[str, dict[str, float | int]] = {}
 
     def resolve_grid(self, *, lat: float, lon: float) -> dict[str, float | int]:
+        if not self.auth_key:
+            raise ValueError("WEATHER_KMA_AUTH_KEY is required for weather sync")
         cache_key = f"{float(lat):.6f}:{float(lon):.6f}"
         if cache_key in self._grid_cache:
             return dict(self._grid_cache[cache_key])

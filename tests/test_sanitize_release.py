@@ -21,6 +21,10 @@ def test_classify_path_catches_required_runtime_artifacts() -> None:
         (Path(".coverage"), False, "tooling cache"),
         (Path("config.toml"), False, "runtime config file"),
         (Path(".codex"), True, "local Codex environment metadata"),
+        (Path(".claude"), True, "local agent/browser state"),
+        (Path(".omc"), True, "local agent/browser state"),
+        (Path(".playwright-mcp"), True, "local agent/browser state"),
+        (Path("_reference"), True, "upstream reference clone"),
         (Path(".venv"), True, "virtual environment"),
         (Path(".cache"), True, "cache directory"),
         (Path("node_modules"), True, "tooling cache"),
@@ -58,6 +62,10 @@ def test_create_staging_dir_skips_runtime_artifacts(tmp_path: Path) -> None:
     (source_root / ".cache" / "tool.tmp").write_text("tmp\n", encoding="utf-8")
     (source_root / ".codex").mkdir()
     (source_root / ".codex" / "environment.toml").write_text("command = 'private'\n", encoding="utf-8")
+    (source_root / ".omc").mkdir()
+    (source_root / ".omc" / "state.json").write_text("{}", encoding="utf-8")
+    (source_root / "_reference").mkdir()
+    (source_root / "_reference" / "README.md").write_text("upstream\n", encoding="utf-8")
     (source_root / "src" / "main.py").write_text("print('ok')\n", encoding="utf-8")
     (source_root / "README.md").write_text("# repo\n", encoding="utf-8")
     (source_root / ".DS_Store").write_text("desktop", encoding="utf-8")
@@ -91,6 +99,8 @@ def test_create_staging_dir_skips_runtime_artifacts(tmp_path: Path) -> None:
     assert not (staging_dir / ".DS_Store").exists()
     assert not (staging_dir / ".cache").exists()
     assert not (staging_dir / ".codex").exists()
+    assert not (staging_dir / ".omc").exists()
+    assert not (staging_dir / "_reference").exists()
     assert not (staging_dir / "src" / "package.egg-info").exists()
     assert not (staging_dir / "config.toml").exists()
     assert not (staging_dir / "data").exists()
