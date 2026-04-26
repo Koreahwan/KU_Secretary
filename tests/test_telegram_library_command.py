@@ -708,7 +708,7 @@ def test_format_lms_materials_scans_modules_and_boards(monkeypatch):
     assert "[KU] 강의자료 위치" in out
     assert "[운영체제]" in out
     assert "- 스케줄링.pdf" in out
-    assert "  모듈 File (9주차)" in out
+    assert "  주차자료 파일 (9주차)" in out
     assert "- 보강 자료 업로드" in out
     assert "  게시판 공지" in out
 

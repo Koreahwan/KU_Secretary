@@ -10610,6 +10610,25 @@ def _format_telegram_lms_board(
     return "\n".join(lines)
 
 
+def _format_lms_module_item_source(item_type: str, module_name: str) -> str:
+    type_label_map = {
+        "assignment": "과제",
+        "discussion": "토론",
+        "externaltool": "외부도구",
+        "externalurl": "외부링크",
+        "file": "파일",
+        "page": "페이지",
+        "quiz": "퀴즈",
+        "subheader": "구분",
+    }
+    normalized = re.sub(r"[^a-z0-9]", "", str(item_type or "").strip().lower())
+    type_label = type_label_map.get(normalized) or (str(item_type or "").strip() or "자료")
+    prefix = f"주차자료 {type_label}"
+    if module_name:
+        prefix += f" ({module_name})"
+    return prefix
+
+
 def _format_telegram_lms_materials(
     *,
     settings: Settings | None = None,
@@ -10682,9 +10701,7 @@ def _format_telegram_lms_materials(
                 if key in seen_titles:
                     continue
                 seen_titles.add(key)
-                prefix = f"모듈 {item_type}"
-                if module_name:
-                    prefix += f" ({module_name})"
+                prefix = _format_lms_module_item_source(item_type, module_name)
                 course_lines.extend([f"- {_truncate_lms_text(title, 62)}", f"  {prefix}"])
                 course_item_count += 1
                 if course_item_count >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
@@ -10740,10 +10757,10 @@ def _format_telegram_lms_materials(
     if not rendered_any:
         lines.append("- 최근 강의자료 위치를 찾지 못했습니다.")
     lines.append(
-        f"- 확인: {scanned_courses}개 과목의 모듈과 게시판을 직접 확인했습니다."
+        f"- 확인: {scanned_courses}개 과목의 주차자료와 게시판을 직접 확인했습니다."
     )
     if module_failures or board_failures:
-        lines.append(f"- 참고: 모듈 실패 {module_failures}건 / 게시판 실패 {board_failures}건")
+        lines.append(f"- 참고: 주차자료 조회 실패 {module_failures}건 / 게시판 조회 실패 {board_failures}건")
     return "\n".join(lines).rstrip()
 
 
@@ -11585,7 +11602,7 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /week : 이번 주 마감 과제",
         "- /submitted : 제출 완료 LMS 과제 (별칭: /submissions /제출완료)",
         "- /board : 과목별 LMS 공지/게시판 최근 글 (별칭: /announcements /공지)",
-        "- /materials : 과목별 LMS 모듈/게시판 강의자료 위치 (별칭: /자료 /강의자료)",
+        "- /materials : 과목별 LMS 주차자료/게시판 자료 위치 (별칭: /자료 /강의자료)",
         "- /status : 현재 동기화 상태",
         *assistant_lines,
         *smart_lines,
