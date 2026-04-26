@@ -65,8 +65,10 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
         if query:
             payload["library"] = query
         return payload
-    if command in {"/assignments", "/due", "/homework", "/과제"}:
+    if command in {"/assignments", "/due", "/homework", "/todo", "/to_submit", "/과제", "/제출할거", "/해야할거"}:
         return {"command": "assignments", "ok": True}
+    if command in {"/submitted", "/submissions", "/done_assignments", "/제출완료", "/낸과제"}:
+        return {"command": "submitted_assignments", "ok": True}
     if command in {"/board", "/lms_board", "/lmsboard", "/announcements", "/공지"}:
         return {"command": "lms_board", "ok": True}
     if command in {"/materials", "/material", "/files", "/자료", "/강의자료"}:

@@ -103,7 +103,13 @@ def test_format_network_error_surfaces_message(monkeypatch):
 
 def test_parse_assignments_aliases():
     expected = {"command": "assignments", "ok": True}
-    for cmd in ("/assignments", "/due", "/homework", "/과제"):
+    for cmd in ("/assignments", "/due", "/homework", "/todo", "/to_submit", "/과제", "/제출할거", "/해야할거"):
+        assert telegram.parse_command_message(cmd) == expected, cmd
+
+
+def test_parse_submitted_assignments_aliases():
+    expected = {"command": "submitted_assignments", "ok": True}
+    for cmd in ("/submitted", "/submissions", "/done_assignments", "/제출완료", "/낸과제"):
         assert telegram.parse_command_message(cmd) == expected, cmd
 
 
@@ -322,6 +328,98 @@ def test_format_assignments_scans_each_course(monkeypatch):
     assert "사이버기술과법 | 개별 강의 과제" in out
 
 
+def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 11, "name": "사이버기술과법"}])
+    monkeypatch.setattr(ku_lms, "get_assignments", lambda s, course_id, *, upcoming_only=False: [])
+    monkeypatch.setattr(
+        ku_lms,
+        "get_announcements",
+        lambda s, course_ids: [
+            {
+                "context_code": "course_11",
+                "title": "보고서 제출 안내",
+                "message": "보고서 과제는 2026-05-01 23:59까지 제출하세요.",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        ku_lms,
+        "get_modules",
+        lambda s, course_id, *, include_items=True: [
+            {
+                "name": "10주차",
+                "items": [
+                    {"title": "실습 과제 제출 2026-05-02 18:00", "type": "File"}
+                ],
+            }
+        ],
+    )
+    monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [{"id": 3, "name": "자료실"}])
+    monkeypatch.setattr(
+        ku_lms,
+        "list_board_posts",
+        lambda s, course_id, board_id, *, page=1, keyword="": {
+            "items": [{"id": 9, "title": "게시판 과제 공지"}]
+        },
+    )
+    monkeypatch.setattr(
+        ku_lms,
+        "get_board_post",
+        lambda s, course_id, board_id, post_id: {
+            "body": "게시판 과제는 2026-05-03 12:00까지 제출"
+        },
+    )
+
+    out = pipeline._format_telegram_assignments()
+    assert "공지/자료/게시판에서 감지" in out
+    assert "사이버기술과법 | 공지" in out
+    assert "사이버기술과법 | 모듈/자료" in out
+    assert "사이버기술과법 | 게시판 자료실" in out
+    assert "확인: 1개 과목의 과제/공지/자료/게시판을 직접 확인했습니다." in out
+
+
+def test_format_submitted_assignments_renders_submission_status(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 11, "name": "사이버기술과법"}])
+    monkeypatch.setattr(
+        ku_lms,
+        "get_submissions",
+        lambda s, course_id: [
+            {
+                "submitted_at": "2026-04-25T12:30:00Z",
+                "workflow_state": "submitted",
+                "late": False,
+                "assignment": {
+                    "name": "완료한 과제",
+                    "due_at": "2026-04-26T14:59:00Z",
+                },
+            },
+            {
+                "submitted_at": None,
+                "workflow_state": "unsubmitted",
+                "assignment": {"name": "아직 안 낸 과제"},
+            },
+        ],
+    )
+
+    out = pipeline._format_telegram_submitted_assignments()
+    assert "[KU] 제출 완료 과제" in out
+    assert "사이버기술과법 | 완료한 과제" in out
+    assert "제출 2026-04-25 12:30" in out
+    assert "아직 안 낸 과제" not in out
+
+
 def test_format_lms_board_renders_per_course(monkeypatch):
     monkeypatch.setenv("KU_PORTAL_ID", "uid")
     monkeypatch.setenv("KU_PORTAL_PW", "pw")
@@ -530,6 +628,18 @@ def test_dispatch_lms_materials_calls_formatter(monkeypatch):
         chat_id="123", user_id=1,
     )
     assert result == {"ok": True, "message": "stub-materials"}
+
+
+def test_dispatch_submitted_assignments_calls_formatter(monkeypatch):
+    monkeypatch.setattr(pipeline, "_format_telegram_submitted_assignments", lambda **kwargs: "stub-submitted")
+    monkeypatch.setattr(pipeline, "_is_telegram_chat_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline, "_resolve_user_scope", lambda *a, **k: {"user_id": 1})
+    result = pipeline._execute_telegram_command(
+        settings=object(), db=object(),
+        command_payload={"command": "submitted_assignments", "ok": True},
+        chat_id="123", user_id=1,
+    )
+    assert result == {"ok": True, "message": "stub-submitted"}
 
 
 def test_dispatch_assignments_calls_formatter(monkeypatch):

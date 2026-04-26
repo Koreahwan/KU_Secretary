@@ -154,6 +154,9 @@ TELEGRAM_LMS_COURSE_SCAN_LIMIT = 20
 TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE = 8
 TELEGRAM_LMS_BOARD_POST_LIMIT_PER_BOARD = 5
 TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT = 16
+TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT = 12
+TELEGRAM_LMS_ASSIGNMENT_BOARD_DETAIL_LIMIT_PER_BOARD = 3
+TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT = 20
 TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE = 5
 TELEGRAM_LMS_MESSAGE_SOFT_LIMIT = 3600
 PORTAL_SECURE_STORAGE_MISSING_REASON = "KU portal session missing from secure storage; reconnect required"
@@ -9242,6 +9245,15 @@ def _resolve_telegram_lms_credentials_from_dotenv(
     return None
 
 
+@dataclass(frozen=True)
+class _TelegramAssignmentHint:
+    course_name: str
+    source_label: str
+    title: str
+    due_at: str
+    evidence: str
+
+
 def _format_telegram_assignments(
     *,
     settings: Settings | None = None,
@@ -9307,19 +9319,28 @@ def _format_telegram_assignments(
         if isinstance(item, dict) and _assignment_key(item)
     }
     course_assignment_rows: list[tuple[str, str, str]] = []
+    source_hint_rows: list[_TelegramAssignmentHint] = []
+    seen_source_hint_keys: set[tuple[str, str, str, str]] = set()
     scanned_courses = 0
     assignment_scan_failures = 0
+    source_scan_failures = 0
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    reference_local = datetime.now(ZoneInfo(timezone_name))
     try:
         courses = ku_lms.get_courses(session) or []
     except Exception:
         courses = []
         assignment_scan_failures += 1
+    course_ids: list[int] = []
+    course_name_by_id: dict[int, str] = {}
     for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
         if not isinstance(course, dict):
             continue
         cid, course_name = _lms_course_id_and_name(course)
         if cid is None:
             continue
+        course_ids.append(cid)
+        course_name_by_id[cid] = course_name
         scanned_courses += 1
         try:
             assignments = ku_lms.get_assignments(session, cid, upcoming_only=True) or []
@@ -9338,12 +9359,183 @@ def _format_telegram_assignments(
             due_at = _pretty_dt(str(assignment.get("due_at") or ""))
             course_assignment_rows.append((course_name, name, due_at))
 
-    if not todos and not events and not course_assignment_rows:
+    def add_source_hints(hints: list[_TelegramAssignmentHint]) -> None:
+        for hint in hints:
+            key = (
+                _normalize_task_title_key(hint.course_name),
+                _normalize_task_title_key(hint.title),
+                str(hint.due_at or "").strip(),
+                str(hint.source_label or "").strip(),
+            )
+            if key in seen_source_hint_keys:
+                continue
+            seen_source_hint_keys.add(key)
+            source_hint_rows.append(hint)
+
+    try:
+        announcements = ku_lms.get_announcements(session, course_ids) if course_ids else []
+    except Exception:
+        announcements = []
+        source_scan_failures += 1
+    for announcement in announcements or []:
+        if not isinstance(announcement, dict):
+            continue
+        cid = _lms_course_id_of_item(announcement)
+        course_name = course_name_by_id.get(cid or -1, "강의")
+        title = str(announcement.get("title") or announcement.get("subject") or "공지").strip()
+        text_lines = [
+            title,
+            *_lms_text_lines_from_dict(
+                announcement,
+                (
+                    "message",
+                    "body",
+                    "description",
+                    "content",
+                    "posted_at",
+                    "created_at",
+                    "delayed_post_at",
+                ),
+            ),
+        ]
+        add_source_hints(
+            _telegram_assignment_hints_from_text(
+                title=title,
+                course_name=course_name,
+                source_label="공지",
+                text_lines=text_lines,
+                timezone_name=timezone_name,
+                reference_local=reference_local,
+            )
+        )
+
+    for cid in course_ids:
+        course_name = course_name_by_id.get(cid, f"course {cid}")
+        try:
+            modules = ku_lms.get_modules(session, cid, include_items=True) or []
+        except Exception:
+            modules = []
+            source_scan_failures += 1
+        for module in modules:
+            if not isinstance(module, dict):
+                continue
+            module_name = str(module.get("name") or module.get("title") or "").strip()
+            module_lines = _lms_text_lines_from_dict(
+                module,
+                ("name", "title", "description", "unlock_at", "due_at"),
+            )
+            items = module.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or item.get("name") or module_name or "자료").strip()
+                text_lines = [
+                    *module_lines,
+                    title,
+                    *_lms_text_lines_from_dict(
+                        item,
+                        (
+                            "title",
+                            "name",
+                            "type",
+                            "content_type",
+                            "html_url",
+                            "url",
+                            "due_at",
+                            "unlock_at",
+                            "completion_requirement",
+                        ),
+                    ),
+                ]
+                add_source_hints(
+                    _telegram_assignment_hints_from_text(
+                        title=title,
+                        course_name=course_name,
+                        source_label="모듈/자료",
+                        text_lines=text_lines,
+                        timezone_name=timezone_name,
+                        reference_local=reference_local,
+                    )
+                )
+
+        try:
+            boards = ku_lms.list_boards(session, cid) or []
+        except Exception:
+            boards = []
+            source_scan_failures += 1
+        for board in boards[:TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE]:
+            if not isinstance(board, dict):
+                continue
+            bid_raw = board.get("id") or board.get("board_id")
+            try:
+                bid = int(bid_raw)
+            except (TypeError, ValueError):
+                continue
+            board_name = str(board.get("name") or board.get("title") or "게시판").strip()
+            try:
+                resp = ku_lms.list_board_posts(session, cid, bid)
+            except Exception:
+                source_scan_failures += 1
+                continue
+            detail_count = 0
+            for post in _lms_board_posts_from_response(resp)[:TELEGRAM_LMS_BOARD_POST_LIMIT_PER_BOARD]:
+                title = str(post.get("title") or post.get("subject") or "게시글").strip()
+                post_text_lines = [
+                    board_name,
+                    title,
+                    *_lms_text_lines_from_dict(
+                        post,
+                        ("title", "subject", "message", "body", "content", "created_at", "posted_at"),
+                    ),
+                ]
+                post_id = _lms_post_id(post)
+                if post_id is not None and detail_count < TELEGRAM_LMS_ASSIGNMENT_BOARD_DETAIL_LIMIT_PER_BOARD:
+                    detail_count += 1
+                    try:
+                        detail = ku_lms.get_board_post(session, cid, bid, post_id) or {}
+                    except Exception:
+                        detail = {}
+                        source_scan_failures += 1
+                    if isinstance(detail, dict):
+                        post_text_lines.extend(
+                            _lms_text_lines_from_dict(
+                                detail,
+                                (
+                                    "title",
+                                    "subject",
+                                    "message",
+                                    "body",
+                                    "content",
+                                    "description",
+                                    "attachments",
+                                    "files",
+                                    "created_at",
+                                    "posted_at",
+                                ),
+                            )
+                        )
+                add_source_hints(
+                    _telegram_assignment_hints_from_text(
+                        title=title,
+                        course_name=course_name,
+                        source_label=f"게시판 {board_name}",
+                        text_lines=post_text_lines,
+                        timezone_name=timezone_name,
+                        reference_local=reference_local,
+                    )
+                )
+
+    if not todos and not events and not course_assignment_rows and not source_hint_rows:
         lines = ["[KU] 내야 할 과제", "- 마감 임박한 과제가 없습니다."]
         if scanned_courses:
-            lines.append(f"- 확인: {scanned_courses}개 과목을 직접 확인했습니다.")
-        if assignment_scan_failures:
-            lines.append(f"- 참고: 일부 과목 조회 실패 {assignment_scan_failures}건")
+            lines.append(f"- 확인: {scanned_courses}개 과목의 과제/공지/자료/게시판을 직접 확인했습니다.")
+        if assignment_scan_failures or source_scan_failures:
+            lines.append(
+                f"- 참고: 일부 조회 실패 과제 {assignment_scan_failures}건 / "
+                f"공지·자료·게시판 {source_scan_failures}건"
+            )
         return "\n".join(lines)
 
     lines = ["[KU] 내야 할 과제"]
@@ -9372,6 +9564,19 @@ def _format_telegram_assignments(
         if remaining > 0:
             lines.append(f"- 외 {remaining}건")
 
+    if source_hint_rows:
+        lines.append("")
+        lines.append(f"공지/자료/게시판에서 감지 ({len(source_hint_rows)}건)")
+        for hint in source_hint_rows[:TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT]:
+            due_at = _pretty_dt(hint.due_at)
+            row = f"- {hint.course_name} | {hint.source_label} | {hint.title}"
+            if due_at:
+                row += f" | 마감 {due_at}"
+            lines.append(row)
+        remaining = len(source_hint_rows) - TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT
+        if remaining > 0:
+            lines.append(f"- 외 {remaining}건")
+
     if events:
         lines.append("")
         lines.append(f"다가오는 이벤트 ({len(events)}건)")
@@ -9383,10 +9588,145 @@ def _format_telegram_assignments(
                 row += f" | {start}"
             lines.append(row)
 
-    if assignment_scan_failures:
+    if scanned_courses:
         lines.append("")
-        lines.append(f"참고: 일부 과목 조회 실패 {assignment_scan_failures}건")
+        lines.append(f"확인: {scanned_courses}개 과목의 과제/공지/자료/게시판을 직접 확인했습니다.")
 
+    if assignment_scan_failures or source_scan_failures:
+        lines.append("")
+        lines.append(
+            f"참고: 일부 조회 실패 과제 {assignment_scan_failures}건 / "
+            f"공지·자료·게시판 {source_scan_failures}건"
+        )
+
+    return "\n".join(lines)
+
+
+def _format_telegram_submitted_assignments(
+    *,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    """Render submitted/graded Canvas assignments for /submitted replies."""
+    from ku_secretary.connectors import ku_lms
+
+    credentials = _resolve_telegram_lms_credentials(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    if credentials is None:
+        return "KU_PORTAL_ID / KU_PORTAL_PW 환경변수가 비어 있습니다."
+    login_id, password = credentials
+
+    try:
+        session = ku_lms.login(user_id=login_id, password=password)
+    except Exception as exc:  # noqa: BLE001
+        return f"LMS 로그인 실패: {exc}"
+
+    try:
+        courses = ku_lms.get_courses(session) or []
+    except Exception as exc:  # noqa: BLE001
+        return f"강의 목록 조회 실패: {exc}"
+    if not courses:
+        return "[KU] 제출 완료 과제\n- 등록된 강의가 없습니다."
+
+    def _pretty_dt(value: str | None) -> str:
+        if not value:
+            return ""
+        v = value.replace("T", " ")
+        return v[:16] if len(v) > 16 else v
+
+    rows: list[dict[str, Any]] = []
+    scanned_courses = 0
+    failures = 0
+    for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+        if not isinstance(course, dict):
+            continue
+        cid, course_name = _lms_course_id_and_name(course)
+        if cid is None:
+            continue
+        scanned_courses += 1
+        try:
+            submissions = ku_lms.get_submissions(session, cid) or []
+        except Exception:
+            failures += 1
+            continue
+        for submission in submissions:
+            if not isinstance(submission, dict):
+                continue
+            assignment = submission.get("assignment") if isinstance(submission.get("assignment"), dict) else {}
+            submitted_at = str(submission.get("submitted_at") or "").strip()
+            workflow_state = str(submission.get("workflow_state") or "").strip().lower()
+            grade = str(submission.get("grade") or submission.get("entered_grade") or "").strip()
+            score = submission.get("score")
+            if not submitted_at and workflow_state not in {"submitted", "graded", "pending_review"}:
+                continue
+            if bool(submission.get("missing")) and not submitted_at:
+                continue
+            title = str(
+                assignment.get("name")
+                or submission.get("assignment_name")
+                or submission.get("title")
+                or "(제목 없음)"
+            ).strip()
+            rows.append(
+                {
+                    "course_name": course_name,
+                    "title": title,
+                    "submitted_at": submitted_at,
+                    "workflow_state": workflow_state or "submitted",
+                    "due_at": str(assignment.get("due_at") or submission.get("cached_due_date") or "").strip(),
+                    "grade": grade,
+                    "score": score,
+                    "late": bool(submission.get("late")),
+                }
+            )
+
+    rows.sort(key=lambda item: str(item.get("submitted_at") or ""), reverse=True)
+    lines = ["[KU] 제출 완료 과제"]
+    if not rows:
+        lines.append("- 제출 완료로 확인된 과제가 없습니다.")
+        if scanned_courses:
+            lines.append(f"- 확인: {scanned_courses}개 과목의 제출 상태를 직접 확인했습니다.")
+        if failures:
+            lines.append(f"- 참고: 일부 과목 제출 상태 조회 실패 {failures}건")
+        return "\n".join(lines)
+
+    lines.append("")
+    lines.append(f"제출 완료 ({len(rows)}건)")
+    for row in rows[:TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT]:
+        pieces = [
+            f"- {row['course_name']} | {row['title']}",
+        ]
+        submitted_at = _pretty_dt(str(row.get("submitted_at") or ""))
+        if submitted_at:
+            pieces.append(f"제출 {submitted_at}")
+        workflow_state = str(row.get("workflow_state") or "").strip()
+        if workflow_state:
+            pieces.append(f"상태 {workflow_state}")
+        due_at = _pretty_dt(str(row.get("due_at") or ""))
+        if due_at:
+            pieces.append(f"마감 {due_at}")
+        grade = str(row.get("grade") or "").strip()
+        score = row.get("score")
+        if grade:
+            pieces.append(f"성적 {grade}")
+        elif score not in (None, ""):
+            pieces.append(f"점수 {score}")
+        if bool(row.get("late")):
+            pieces.append("지각 제출")
+        lines.append(" | ".join(pieces))
+    remaining = len(rows) - TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT
+    if remaining > 0:
+        lines.append(f"- 외 {remaining}건")
+    lines.append("")
+    lines.append(f"확인: {scanned_courses}개 과목의 제출 상태를 직접 확인했습니다.")
+    if failures:
+        lines.append(f"참고: 일부 과목 제출 상태 조회 실패 {failures}건")
     return "\n".join(lines)
 
 
@@ -9414,6 +9754,128 @@ def _lms_board_posts_from_response(response: Any) -> list[dict[str, Any]]:
         if isinstance(value, list):
             return [item for item in value if isinstance(item, dict)]
     return []
+
+
+def _lms_first_present(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _lms_course_id_of_item(item: dict[str, Any]) -> int | None:
+    for key in ("course_id", "courseId", "context_id"):
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            pass
+    context_code = str(item.get("context_code") or "").strip()
+    if context_code.startswith("course_"):
+        try:
+            return int(context_code.split("_", 1)[1])
+        except ValueError:
+            return None
+    return None
+
+
+def _lms_post_id(item: dict[str, Any]) -> int | None:
+    for key in ("id", "post_id", "postId", "article_id", "articleId"):
+        value = item.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _lms_plain_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "<" in text and ">" in text:
+        text = MATERIAL_HTML_DROP_BLOCK_RE.sub(" ", text)
+        text = MATERIAL_BREAK_TAG_RE.sub("\n", text)
+        text = MATERIAL_BLOCK_TAG_RE.sub("\n", text)
+        text = MATERIAL_HTML_TAG_RE.sub(" ", text)
+    return re.sub(r"\s+", " ", html.unescape(text)).strip()
+
+
+def _lms_text_lines_from_dict(item: dict[str, Any], keys: tuple[str, ...]) -> list[str]:
+    lines: list[str] = []
+    for key in keys:
+        value = item.get(key)
+        if isinstance(value, list):
+            for subvalue in value:
+                if isinstance(subvalue, dict):
+                    nested = _lms_plain_text(
+                        _lms_first_present(
+                            subvalue,
+                            ("display_name", "filename", "name", "title", "content", "body"),
+                        )
+                    )
+                    if nested:
+                        lines.append(nested)
+                else:
+                    nested = _lms_plain_text(subvalue)
+                    if nested:
+                        lines.append(nested)
+            continue
+        if isinstance(value, dict):
+            nested = _lms_plain_text(
+                _lms_first_present(
+                    value,
+                    ("display_name", "filename", "name", "title", "content", "body"),
+                )
+            )
+            if nested:
+                lines.append(nested)
+            continue
+        text = _lms_plain_text(value)
+        if text:
+            lines.append(text)
+    return lines
+
+
+def _telegram_assignment_hints_from_text(
+    *,
+    title: str,
+    course_name: str,
+    source_label: str,
+    text_lines: list[str],
+    timezone_name: str,
+    reference_local: datetime,
+) -> list[_TelegramAssignmentHint]:
+    extracted_text = "\n".join(line for line in text_lines if str(line or "").strip())
+    if not _contains_material_task_hints(title, extracted_text):
+        return []
+    rows: list[_TelegramAssignmentHint] = []
+    for task in _heuristic_material_deadline_tasks(
+        title=title,
+        course_name=course_name,
+        extracted_text=extracted_text,
+        timezone_name=timezone_name,
+        reference_local=reference_local,
+    ):
+        due_at = str(task.get("due_at") or "").strip()
+        task_title = str(task.get("title") or title or "과제").strip()
+        if not due_at or not task_title:
+            continue
+        rows.append(
+            _TelegramAssignmentHint(
+                course_name=course_name,
+                source_label=source_label,
+                title=task_title,
+                due_at=due_at,
+                evidence=str(task.get("evidence") or "").strip(),
+            )
+        )
+    return rows
 
 
 def _append_limited_telegram_line(lines: list[str], line: str) -> bool:
@@ -10415,6 +10877,7 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "notice_academic", "description": "학교 학사공지 10개 보기"},
         {"command": "library", "description": "도서관 좌석 현황 보기"},
         {"command": "assignments", "description": "내야 할 과제 목록 보기"},
+        {"command": "submitted", "description": "제출 완료 과제 보기"},
         {"command": "board", "description": "과목별 게시판/공지 모음 보기"},
         {"command": "materials", "description": "과목별 강의자료 위치 보기"},
         {"command": "inbox", "description": "임시 draft 목록 보기"},
@@ -10535,7 +10998,8 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /notice_general : 학교 일반공지",
         "- /notice_academic : 학교 학사공지",
         "- /library [도서관명] : 도서관 좌석 현황 (예: /library 중앙도서관)",
-        "- /assignments : 마감 임박한 LMS 과제와 이벤트 (별칭: /due /homework /과제)",
+        "- /assignments : 제출해야 할 LMS 과제/공지/자료/게시판 감지 항목 (별칭: /due /todo /과제)",
+        "- /submitted : 제출 완료 LMS 과제 (별칭: /submissions /제출완료)",
         "- /board : 과목별 LMS 공지/게시판 최근 글 (별칭: /announcements /공지)",
         "- /materials : 과목별 LMS 모듈/게시판 강의자료 위치 (별칭: /자료 /강의자료)",
         "- /status : 현재 동기화 상태",
@@ -11279,6 +11743,16 @@ def _execute_telegram_command(
         return {
             "ok": True,
             "message": _format_telegram_assignments(
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
+        }
+    if command == "submitted_assignments":
+        return {
+            "ok": True,
+            "message": _format_telegram_submitted_assignments(
                 settings=settings,
                 db=db,
                 user_id=user_id,
