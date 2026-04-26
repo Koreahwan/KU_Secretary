@@ -68,6 +68,8 @@ def test_sync_telegram_registers_bot_menu_commands(
     assert {"command": "connect", "description": "학교 계정 연결"} not in commands
     assert {"command": "plan", "description": "자연어 리마인더 예약"} not in commands
     assert {"command": "done", "description": "과제 완료 처리하기"} not in commands
+    assert {"command": "inbox", "description": "임시 draft 목록 보기"} not in commands
+    assert {"command": "apply", "description": "inbox draft 반영하기"} not in commands
     assert first["menu"]["updated"] is True
     assert second["menu"]["updated"] is False
 
@@ -4280,7 +4282,7 @@ def test_format_telegram_status_falls_back_to_global_sync_state_for_user_scope(t
     assert "UClass: 준비됨" in message
 
 
-def test_sync_telegram_apply_command_returns_human_friendly_summary(
+def test_sync_telegram_apply_command_is_removed(
     tmp_path: Path, monkeypatch
 ) -> None:
     db = Database(tmp_path / "ku.db")
@@ -4337,11 +4339,12 @@ def test_sync_telegram_apply_command_returns_human_friendly_summary(
     result = pipeline.sync_telegram(settings=settings, db=db)
 
     assert result["commands"]["processed"] == 1
+    assert result["commands"]["failed"] == 1
     assert len(sent_messages) == 1
-    message = sent_messages[0][1]
-    assert "[KU] Inbox 반영" in message
-    assert "- 처리 1건" in message
-    assert "- 생성: 일정 0건 / 과제 1건 / 메모 0건" in message
+    assert sent_messages[0] == ("12345", "unsupported command: /apply")
+    inbox_items = db.list_unprocessed_inbox(limit=10)
+    assert len(inbox_items) == 1
+    assert inbox_items[0].external_id == "telegram:draft:1"
 
 
 def test_sync_telegram_done_command_is_removed(

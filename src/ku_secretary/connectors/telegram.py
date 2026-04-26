@@ -87,15 +87,6 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
         if school_query:
             payload["school_query"] = school_query
         return payload
-    if command == "/inbox":
-        return {"command": "inbox", "ok": True}
-    if command == "/apply":
-        if len(parts) < 2:
-            return {"command": "apply", "ok": False, "error": "missing id or 'all'"}
-        target = parts[1].strip()
-        if target.lower() == "all":
-            return {"command": "apply", "ok": True, "scope": "all"}
-        return {"command": "apply", "ok": True, "scope": "id", "id": target}
     if command == "/plan":
         instruction = body[len(parts[0]) :].strip()
         if not instruction:

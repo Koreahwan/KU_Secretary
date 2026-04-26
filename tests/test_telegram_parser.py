@@ -62,7 +62,16 @@ def test_normalize_updates_honors_chat_filter() -> None:
 
 
 def test_parse_command_message_done_command_removed() -> None:
-    for text in ("/done", "/done task", "/done task inbox:123", "/done review 123"):
+    for text in (
+        "/done",
+        "/done task",
+        "/done task inbox:123",
+        "/done review 123",
+        "/inbox",
+        "/apply",
+        "/apply all",
+        "/apply 12",
+    ):
         parsed = parse_command_message(text)
         assert parsed is not None
         assert parsed["ok"] is False

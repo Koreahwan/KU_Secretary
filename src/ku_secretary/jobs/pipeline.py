@@ -8317,7 +8317,7 @@ def _format_telegram_apply_result(result: dict[str, Any]) -> str:
     lines = ["[KU] Inbox 반영", ""]
     if processed <= 0:
         lines.append("- 반영할 draft가 없습니다.")
-        lines.append("- 새 메모를 보내면 `/inbox`에서 다시 확인할 수 있습니다.")
+        lines.append("- Telegram 초안 반영 명령은 현재 비활성화되어 있습니다.")
         return "\n".join(lines)
     lines.extend(
         [
@@ -8332,7 +8332,7 @@ def _format_telegram_apply_result(result: dict[str, Any]) -> str:
             "",
             "다음으로 해볼 것",
             "- `/today`로 오늘 일정과 과제를 확인하세요.",
-            "- 남은 초안이 있으면 `/inbox`를 다시 확인하세요.",
+            "- 남은 초안은 CLI inbox 도구에서 확인할 수 있습니다.",
         ]
     )
     return "\n".join(lines)
@@ -8548,7 +8548,7 @@ def _format_telegram_status(
 
     _append_message_section(lines, "추천")
     if int(sync_dashboard.get("pending_inbox_count") or 0) > 0:
-        lines.append("- `/inbox`로 새 초안을 확인하세요.")
+        lines.append("- 처리 대기 중인 로컬 초안이 있습니다.")
     if int(counts.get("events", 0)) or int(counts.get("tasks", 0)):
         lines.append("- `/today`로 오늘 일정과 과제를 확인하세요.")
     else:
@@ -10899,9 +10899,9 @@ def _format_telegram_inbox(db: Database, *, user_id: int | None = None) -> str:
     lines.extend(
         [
             "",
-            "바로 반영",
-            "- `/apply <id>` 예: `/apply 12`",
-            "- 여러 개를 한 번에 반영: `/apply all`",
+            "반영",
+            "- Telegram 초안 반영 명령은 현재 비활성화되어 있습니다.",
+            "- 필요한 경우 CLI inbox 도구를 사용하세요.",
         ]
     )
     return "\n".join(lines)
@@ -11482,8 +11482,6 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "submitted", "description": "제출 완료 과제 보기"},
         {"command": "board", "description": "과목별 게시판/공지 모음 보기"},
         {"command": "materials", "description": "과목별 강의자료 위치 보기"},
-        {"command": "inbox", "description": "임시 draft 목록 보기"},
-        {"command": "apply", "description": "inbox draft 반영하기"},
     ]
     if not bool(getattr(settings, "telegram_assistant_enabled", False)):
         commands = [item for item in commands if item.get("command") != "bot"]
@@ -11605,19 +11603,7 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /status : 현재 동기화 상태",
         *assistant_lines,
         *smart_lines,
-        "",
-        "관리 명령",
-        "- /inbox : 임시 draft 목록",
-        "- /apply <id|all> : inbox draft 반영",
     ]
-    lines.extend(
-        [
-            "",
-            "빠른 흐름",
-            "- 메모를 그냥 보내면 `/inbox`에 초안으로 저장됩니다.",
-            "- `/inbox`를 본 뒤 `/apply <id>` 또는 `/apply all`로 반영할 수 있습니다.",
-        ]
-    )
     return "\n".join(lines)
 
 
@@ -12399,18 +12385,6 @@ def _execute_telegram_command(
                 user_id=user_id,
             ),
         }
-    if command == "inbox":
-        return {"ok": True, "message": _format_telegram_inbox(db, user_id=user_id)}
-    if command == "apply":
-        scope = str(command_payload.get("scope") or "")
-        if scope == "all":
-            result = apply_inbox_items(settings=settings, db=db, apply_all=True, user_id=user_id)
-            return {"ok": True, "message": _format_telegram_apply_result(result)}
-        selected_id = _safe_int(command_payload.get("id"))
-        if selected_id is None:
-            return {"ok": False, "error": "apply id must be numeric inbox row id"}
-        result = apply_inbox_items(settings=settings, db=db, item_id=selected_id, user_id=user_id)
-        return {"ok": True, "message": _format_telegram_apply_result(result)}
     if command == "plan":
         if not chat_id:
             return {"ok": False, "error": "chat_id is missing for /plan"}
