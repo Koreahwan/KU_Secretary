@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from ku_secretary.connectors import telegram
@@ -255,6 +257,35 @@ def test_format_assignments_prefers_user_login_secret(monkeypatch):
         "chat_id": "123",
         "login": "student-id:student-pw",
     }
+
+
+def test_format_assignments_reads_settings_dotenv(monkeypatch, tmp_path):
+    monkeypatch.delenv("KU_PORTAL_ID", raising=False)
+    monkeypatch.delenv("KU_PORTAL_PW", raising=False)
+    (tmp_path / ".env").write_text(
+        "KU_PORTAL_ID=student-id\nKU_PORTAL_PW=student-pw\n",
+        encoding="utf-8",
+    )
+    settings = SimpleNamespace(
+        storage_root_dir=tmp_path,
+        database_path=tmp_path / "data" / "ku.db",
+    )
+
+    from ku_secretary.connectors import ku_lms
+
+    seen: dict[str, str] = {}
+
+    def fake_login(*, user_id, password):
+        seen["login"] = f"{user_id}:{password}"
+        return "s"
+
+    monkeypatch.setattr(ku_lms, "login", fake_login)
+    monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
+
+    out = pipeline._format_telegram_assignments(settings=settings)
+    assert "마감 임박한 과제가 없습니다" in out
+    assert seen == {"login": "student-id:student-pw"}
 
 
 def test_parse_board_aliases():

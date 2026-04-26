@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from dateutil import parser as dt_parser
 from dateutil.rrule import rrulestr
+from dotenv import dotenv_values
 import requests
 
 from ku_secretary.assistant import (
@@ -9188,6 +9189,50 @@ def _resolve_telegram_lms_credentials(
     env_password = os.environ.get("KU_PORTAL_PW", "").strip()
     if env_user_id and env_password:
         return env_user_id, env_password
+
+    dotenv_credentials = _resolve_telegram_lms_credentials_from_dotenv(settings)
+    if dotenv_credentials is not None:
+        return dotenv_credentials
+    return None
+
+
+def _resolve_telegram_lms_credentials_from_dotenv(
+    settings: Settings | None,
+) -> tuple[str, str] | None:
+    if settings is None:
+        return None
+
+    candidates: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_candidate(path: Path) -> None:
+        resolved = path.expanduser().resolve()
+        if resolved in seen:
+            return
+        seen.add(resolved)
+        candidates.append(resolved)
+
+    storage_root_dir = getattr(settings, "storage_root_dir", None)
+    if storage_root_dir:
+        add_candidate(Path(storage_root_dir) / ".env")
+
+    database_path = getattr(settings, "database_path", None)
+    if database_path:
+        db_parent = Path(database_path).expanduser().resolve().parent
+        add_candidate(db_parent / ".env")
+        add_candidate(db_parent.parent / ".env")
+
+    for env_path in candidates:
+        try:
+            if not env_path.is_file():
+                continue
+            values = dotenv_values(env_path)
+        except OSError:
+            continue
+        env_user_id = str(values.get("KU_PORTAL_ID") or "").strip()
+        env_password = str(values.get("KU_PORTAL_PW") or "").strip()
+        if env_user_id and env_password:
+            return env_user_id, env_password
     return None
 
 
