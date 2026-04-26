@@ -9372,7 +9372,7 @@ def _format_telegram_assignments(
         for item in todos
         if isinstance(item, dict) and _assignment_key(item)
     }
-    course_assignment_rows: list[tuple[str, str, str]] = []
+    course_assignment_rows: list[dict[str, Any]] = []
     source_hint_rows: list[_TelegramAssignmentHint] = []
     seen_source_hint_keys: set[tuple[str, str, str, str]] = set()
     scanned_courses = 0
@@ -9411,7 +9411,14 @@ def _format_telegram_assignments(
                 seen_assignment_keys.add(key)
             name = str(assignment.get("name") or assignment.get("title") or "(제목 없음)").strip()
             due_at = _pretty_dt(str(assignment.get("due_at") or ""))
-            course_assignment_rows.append((course_name, name, due_at))
+            course_assignment_rows.append(
+                {
+                    "course_id": cid,
+                    "course_name": course_name,
+                    "title": name,
+                    "due_at": due_at,
+                }
+            )
 
     def add_source_hints(hints: list[_TelegramAssignmentHint]) -> None:
         for hint in hints:
@@ -9593,54 +9600,111 @@ def _format_telegram_assignments(
         return "\n".join(lines)
 
     lines = ["[KU] 내야 할 과제"]
+    known_course_order = list(course_ids)
+    course_groups: dict[int | str, dict[str, Any]] = {}
+
+    def course_group_key(course_id: int | None, fallback_name: str = "기타") -> int | str:
+        if course_id is not None:
+            return course_id
+        return fallback_name
+
+    def ensure_course_group(course_id: int | None, course_name: str = "기타") -> dict[str, Any]:
+        key = course_group_key(course_id, course_name)
+        if key not in course_groups:
+            course_groups[key] = {
+                "name": course_name_by_id.get(course_id or -1, course_name),
+                "todos": [],
+                "course_assignments": [],
+                "source_hints": [],
+                "events": [],
+            }
+        return course_groups[key]
 
     if todos:
-        lines.append("")
-        lines.append(f"과제 ({len(todos)}건)")
         for t in todos:
-            a = t.get("assignment") or {}
+            if not isinstance(t, dict):
+                continue
+            a = t.get("assignment") if isinstance(t.get("assignment"), dict) else {}
+            cid = _lms_course_id_of_item(a) or _lms_course_id_of_item(t)
+            course_name = course_name_by_id.get(cid or -1, "Canvas 할 일")
             name = (a.get("name") or t.get("title") or "(제목 없음)").strip()
             due_at = _pretty_dt(a.get("due_at"))
+            ensure_course_group(cid, course_name)["todos"].append({"title": name, "due_at": due_at})
+
+    for row in course_assignment_rows:
+        cid = row.get("course_id") if isinstance(row.get("course_id"), int) else None
+        course_name = str(row.get("course_name") or course_name_by_id.get(cid or -1, "강의"))
+        ensure_course_group(cid, course_name)["course_assignments"].append(row)
+
+    for hint in source_hint_rows:
+        matched_cid = None
+        for cid, course_name in course_name_by_id.items():
+            if course_name == hint.course_name:
+                matched_cid = cid
+                break
+        ensure_course_group(matched_cid, hint.course_name)["source_hints"].append(hint)
+
+    if events:
+        for ev in events[:8]:
+            if not isinstance(ev, dict):
+                continue
+            cid = _lms_course_id_of_item(ev)
+            course_name = course_name_by_id.get(cid or -1, "다가오는 이벤트")
+            title = (ev.get("title") or "(제목 없음)").strip()
+            start = _pretty_dt(ev.get("start_at"))
+            ensure_course_group(cid, course_name)["events"].append({"title": title, "start_at": start})
+
+    ordered_keys: list[int | str] = [cid for cid in known_course_order if cid in course_groups]
+    ordered_keys.extend(key for key in course_groups if key not in ordered_keys)
+    rendered_course_items = 0
+    rendered_source_hints = 0
+    for key in ordered_keys:
+        group = course_groups[key]
+        lines.append("")
+        lines.append(f"[{_compact_lms_course_name(group['name'])}]")
+        if group["todos"] or group["course_assignments"]:
+            lines.append("과제")
+        for row in group["todos"]:
             details = []
-            if due_at:
-                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
-            _append_lms_list_item(lines, title=name, details=details)
-
-    if course_assignment_rows:
-        lines.append("")
-        lines.append(f"과목별 과제 확인 ({len(course_assignment_rows)}건, {scanned_courses}개 과목 스캔)")
-        for course_name, name, due_at in course_assignment_rows[:TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT]:
-            details = [_compact_lms_course_name(course_name)]
-            if due_at:
-                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
-            _append_lms_list_item(lines, title=name, details=details)
-        remaining = len(course_assignment_rows) - TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT
-        if remaining > 0:
-            lines.append(f"- 외 {remaining}건")
-
-    if source_hint_rows:
-        lines.append("")
-        lines.append(f"공지/자료/게시판의 제출 항목 ({len(source_hint_rows)}건)")
-        for hint in source_hint_rows[:TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT]:
+            if row.get("due_at"):
+                details.append(f"마감 {_format_lms_list_dt(row['due_at'], timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=row["title"], details=details)
+        for row in group["course_assignments"]:
+            if rendered_course_items >= TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT:
+                continue
+            details = []
+            if row.get("due_at"):
+                details.append(f"마감 {_format_lms_list_dt(row['due_at'], timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=row["title"], details=details)
+            rendered_course_items += 1
+        if group["source_hints"]:
+            lines.append("공지/자료/게시판 제출 항목")
+        for hint in group["source_hints"]:
+            if rendered_source_hints >= TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT:
+                continue
             due_at = _pretty_dt(hint.due_at)
-            details = [_compact_lms_course_name(hint.course_name), str(hint.source_label or "").strip()]
+            details = [str(hint.source_label or "").strip()]
             if due_at:
                 details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
             _append_lms_list_item(lines, title=hint.title, details=details)
-        remaining = len(source_hint_rows) - TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT
-        if remaining > 0:
-            lines.append(f"- 외 {remaining}건")
-
-    if events:
-        lines.append("")
-        lines.append(f"다가오는 이벤트 ({len(events)}건)")
-        for ev in events[:8]:
-            title = (ev.get("title") or "(제목 없음)").strip()
-            start = _pretty_dt(ev.get("start_at"))
+            rendered_source_hints += 1
+        if group["events"]:
+            lines.append("이벤트")
+        for event in group["events"]:
             details = []
-            if start:
-                details.append(f"일정 {_format_lms_list_dt(start, timezone_name=timezone_name)}")
-            _append_lms_list_item(lines, title=title, details=details)
+            if event.get("start_at"):
+                details.append(f"일정 {_format_lms_list_dt(event['start_at'], timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=event["title"], details=details)
+    remaining_course_items = len(course_assignment_rows) - rendered_course_items
+    remaining_source_hints = len(source_hint_rows) - rendered_source_hints
+    if remaining_course_items > 0 or remaining_source_hints > 0:
+        lines.append("")
+        omitted = []
+        if remaining_course_items > 0:
+            omitted.append(f"과제 {remaining_course_items}건")
+        if remaining_source_hints > 0:
+            omitted.append(f"공지/자료/게시판 제출 항목 {remaining_source_hints}건")
+        lines.append(f"- 외 {' / '.join(omitted)}")
 
     if scanned_courses:
         lines.append("")
@@ -9795,6 +9859,7 @@ def _format_telegram_submitted_assignments(
             rows.append(
                 {
                     "course_name": course_name,
+                    "course_id": cid,
                     "title": title,
                     "submitted_at": submitted_at,
                     "workflow_state": workflow_state or "submitted",
@@ -9817,28 +9882,44 @@ def _format_telegram_submitted_assignments(
 
     lines.append("")
     lines.append(f"제출 완료 ({len(rows)}건)")
-    for row in rows[:TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT]:
-        lines.append(f"- {_truncate_lms_text(row['title'], 62)}")
-        pieces = [_compact_lms_course_name(row["course_name"])]
-        submitted_at = _pretty_dt(str(row.get("submitted_at") or ""))
-        if submitted_at:
-            pieces.append(f"제출 {_format_lms_list_dt(submitted_at, timezone_name=timezone_name)}")
-        workflow_state = str(row.get("workflow_state") or "").strip()
-        if workflow_state:
-            pieces.append(_lms_submission_status_label(workflow_state))
-        due_at = _pretty_dt(str(row.get("due_at") or ""))
-        if due_at:
-            pieces.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
-        grade = str(row.get("grade") or "").strip()
-        score = row.get("score")
-        if grade:
-            pieces.append(f"성적 {grade}")
-        elif score not in (None, ""):
-            pieces.append(f"점수 {score}")
-        if bool(row.get("late")):
-            pieces.append("지각 제출")
-        lines.append(f"  {' | '.join(item for item in pieces if item)}")
-    remaining = len(rows) - TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT
+    grouped_rows: dict[int, list[dict[str, Any]]] = {}
+    course_names: dict[int, str] = {}
+    for row in rows:
+        cid = int(row["course_id"])
+        grouped_rows.setdefault(cid, []).append(row)
+        course_names[cid] = str(row.get("course_name") or f"course {cid}")
+    rendered = 0
+    for course in _lms_scannable_courses(courses)[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+        cid, fallback_name = _lms_course_id_and_name(course)
+        if cid is None or cid not in grouped_rows:
+            continue
+        lines.append("")
+        lines.append(f"[{_compact_lms_course_name(course_names.get(cid, fallback_name))}]")
+        for row in grouped_rows[cid]:
+            if rendered >= TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT:
+                continue
+            lines.append(f"- {_truncate_lms_text(row['title'], 62)}")
+            pieces = []
+            submitted_at = _pretty_dt(str(row.get("submitted_at") or ""))
+            if submitted_at:
+                pieces.append(f"제출 {_format_lms_list_dt(submitted_at, timezone_name=timezone_name)}")
+            workflow_state = str(row.get("workflow_state") or "").strip()
+            if workflow_state:
+                pieces.append(_lms_submission_status_label(workflow_state))
+            due_at = _pretty_dt(str(row.get("due_at") or ""))
+            if due_at:
+                pieces.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+            grade = str(row.get("grade") or "").strip()
+            score = row.get("score")
+            if grade:
+                pieces.append(f"성적 {grade}")
+            elif score not in (None, ""):
+                pieces.append(f"점수 {score}")
+            if bool(row.get("late")):
+                pieces.append("지각 제출")
+            lines.append(f"  {' | '.join(item for item in pieces if item)}")
+            rendered += 1
+    remaining = len(rows) - rendered
     if remaining > 0:
         lines.append(f"- 외 {remaining}건")
     lines.append("")

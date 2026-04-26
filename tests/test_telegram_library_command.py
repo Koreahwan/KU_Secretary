@@ -143,10 +143,11 @@ def test_format_assignments_renders_todo_and_events(monkeypatch):
 
     out = pipeline._format_telegram_assignments()
     assert "[KU] 내야 할 과제" in out
+    assert "[할 일]" in out
     assert "중간고사 대체 과제" in out
     assert "04/26 23:59" in out
-    assert "과제 (1건)" in out
-    assert "다가오는 이벤트 (1건)" in out
+    assert "과제" in out
+    assert "이벤트" in out
 
 
 def test_format_assignments_empty(monkeypatch):
@@ -214,9 +215,10 @@ def test_format_assignments_ignores_event_fetch_failure(monkeypatch):
         lambda s: (_ for _ in ()).throw(RuntimeError("events down")),
     )
     out = pipeline._format_telegram_assignments()
-    assert "과제 (1건)" in out
+    assert "[할 일]" in out
+    assert "과제" in out
     assert "보고서" in out
-    assert "다가오는 이벤트" not in out
+    assert "이벤트" not in out
 
 
 def test_format_assignments_prefers_user_login_secret(monkeypatch):
@@ -324,9 +326,9 @@ def test_format_assignments_scans_each_course(monkeypatch):
     )
 
     out = pipeline._format_telegram_assignments()
-    assert "과목별 과제 확인" in out
+    assert "[사이버기술과법]" in out
     assert "- 개별 강의 과제" in out
-    assert "  사이버기술과법 | 마감 04/30 23:00" in out
+    assert "  마감 04/30 23:00" in out
 
 
 def test_format_assignments_skips_restricted_shell_courses(monkeypatch):
@@ -417,11 +419,12 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
     )
 
     out = pipeline._format_telegram_assignments()
-    assert "공지/자료/게시판의 제출 항목" in out
+    assert "공지/자료/게시판 제출 항목" in out
     assert "중간고사 과제 우수자 발표 안내" not in out
-    assert "  사이버기술과법 | 공지 | 마감 05/01 23:59" in out
-    assert "  사이버기술과법 | 모듈/자료 | 마감 05/02 18:00" in out
-    assert "  사이버기술과법 | 게시판 자료실 | 마감 05/03 12:00" in out
+    assert "[사이버기술과법]" in out
+    assert "  공지 | 마감 05/01 23:59" in out
+    assert "  모듈/자료 | 마감 05/02 18:00" in out
+    assert "  게시판 자료실 | 마감 05/03 12:00" in out
     assert "확인: 1개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다." in out
 
 
@@ -455,8 +458,9 @@ def test_format_submitted_assignments_renders_submission_status(monkeypatch):
 
     out = pipeline._format_telegram_submitted_assignments()
     assert "[KU] 제출 완료 과제" in out
+    assert "[사이버기술과법]" in out
     assert "- 완료한 과제" in out
-    assert "  사이버기술과법 | 제출 04/25 21:30 | 제출됨 | 마감 04/26 23:59" in out
+    assert "  제출 04/25 21:30 | 제출됨 | 마감 04/26 23:59" in out
     assert "아직 안 낸 과제" not in out
 
 
@@ -495,7 +499,8 @@ def test_format_submitted_assignments_compacts_long_course_names(monkeypatch):
     out = pipeline._format_telegram_submitted_assignments()
     assert "261R" not in out
     assert "CYBER TECHNOLOGY" not in out
-    assert "  사이버기술과법 00분반 | 제출 04/25 21:30 | 채점됨 | 마감 04/26 23:59 | 성적 24" in out
+    assert "[사이버기술과법 00분반]" in out
+    assert "  제출 04/25 21:30 | 채점됨 | 마감 04/26 23:59 | 성적 24" in out
 
 
 def test_format_lms_board_renders_per_course(monkeypatch):
