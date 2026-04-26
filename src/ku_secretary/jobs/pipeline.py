@@ -11484,7 +11484,6 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "materials", "description": "과목별 강의자료 위치 보기"},
         {"command": "inbox", "description": "임시 draft 목록 보기"},
         {"command": "apply", "description": "inbox draft 반영하기"},
-        {"command": "done", "description": "과제 완료 처리하기"},
     ]
     if not bool(getattr(settings, "telegram_assistant_enabled", False)):
         commands = [item for item in commands if item.get("command") != "bot"]
@@ -11606,7 +11605,6 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /status : 현재 동기화 상태",
         *assistant_lines,
         *smart_lines,
-        "- /done task <id|external_id> : 과제 완료 처리",
         "",
         "관리 명령",
         "- /inbox : 임시 draft 목록",
@@ -12413,22 +12411,6 @@ def _execute_telegram_command(
             return {"ok": False, "error": "apply id must be numeric inbox row id"}
         result = apply_inbox_items(settings=settings, db=db, item_id=selected_id, user_id=user_id)
         return {"ok": True, "message": _format_telegram_apply_result(result)}
-    if command == "done":
-        target = str(command_payload.get("target") or "").strip().lower()
-        selector = str(command_payload.get("id") or "").strip()
-        if target == "task":
-            result = mark_task_status(
-                settings=settings,
-                db=db,
-                selector=selector,
-                status="done",
-                user_id=user_id,
-            )
-            return {
-                "ok": bool(result.get("ok")),
-                "message": _format_telegram_done_result(result, timezone_name=settings.timezone),
-            }
-        return {"ok": False, "error": "done target must be task"}
     if command == "plan":
         if not chat_id:
             return {"ok": False, "error": "chat_id is missing for /plan"}

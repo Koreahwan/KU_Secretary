@@ -61,13 +61,12 @@ def test_normalize_updates_honors_chat_filter() -> None:
     assert items[0].external_id == "telegram:update:1"
 
 
-def test_parse_command_message_done_task() -> None:
-    parsed = parse_command_message("/done task inbox:123")
-    assert parsed is not None
-    assert parsed["ok"] is True
-    assert parsed["command"] == "done"
-    assert parsed["target"] == "task"
-    assert parsed["id"] == "inbox:123"
+def test_parse_command_message_done_command_removed() -> None:
+    for text in ("/done", "/done task", "/done task inbox:123", "/done review 123"):
+        parsed = parse_command_message(text)
+        assert parsed is not None
+        assert parsed["ok"] is False
+        assert parsed["command"] == "unknown"
 
 
 def test_classify_message_command() -> None:
@@ -75,19 +74,6 @@ def test_classify_message_command() -> None:
     assert item_type == "command"
     assert draft["command"] == "status"
     assert draft["ok"] is True
-
-
-def test_parse_command_message_invalid_payload() -> None:
-    parsed = parse_command_message("/done task")
-    assert parsed is not None
-    assert parsed["ok"] is False
-
-
-def test_parse_command_message_rejects_review_target() -> None:
-    parsed = parse_command_message("/done review 123")
-    assert parsed is not None
-    assert parsed["ok"] is False
-    assert parsed["error"] == "target must be task"
 
 
 def test_parse_command_message_plan() -> None:

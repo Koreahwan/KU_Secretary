@@ -67,6 +67,7 @@ def test_sync_telegram_registers_bot_menu_commands(
     assert {"command": "setup", "description": "연결 상태 점검"} not in commands
     assert {"command": "connect", "description": "학교 계정 연결"} not in commands
     assert {"command": "plan", "description": "자연어 리마인더 예약"} not in commands
+    assert {"command": "done", "description": "과제 완료 처리하기"} not in commands
     assert first["menu"]["updated"] is True
     assert second["menu"]["updated"] is False
 
@@ -4343,7 +4344,7 @@ def test_sync_telegram_apply_command_returns_human_friendly_summary(
     assert "- 생성: 일정 0건 / 과제 1건 / 메모 0건" in message
 
 
-def test_sync_telegram_done_command_returns_human_friendly_summary(
+def test_sync_telegram_done_command_is_removed(
     tmp_path: Path, monkeypatch
 ) -> None:
     db = Database(tmp_path / "ku.db")
@@ -4393,12 +4394,12 @@ def test_sync_telegram_done_command_returns_human_friendly_summary(
     result = pipeline.sync_telegram(settings=settings, db=db)
 
     assert result["commands"]["processed"] == 1
+    assert result["commands"]["failed"] == 1
     assert len(sent_messages) == 1
-    message = sent_messages[0][1]
-    assert "[KU] 과제 상태 변경" in message
-    assert "- 과제: 과제 1 제출" in message
-    assert "- 상태: done" in message
-    assert "- ID: uclass:task:done-1" in message
+    assert sent_messages[0] == ("12345", "unsupported command: /done")
+    task = db.get_task_for_selector("uclass:task:done-1")
+    assert task is not None
+    assert task["status"] == "open"
 
 
 def test_sync_uclass_records_reconnect_required_error_state(tmp_path: Path, monkeypatch) -> None:

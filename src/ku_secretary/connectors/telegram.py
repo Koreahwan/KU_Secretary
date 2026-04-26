@@ -96,16 +96,6 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
         if target.lower() == "all":
             return {"command": "apply", "ok": True, "scope": "all"}
         return {"command": "apply", "ok": True, "scope": "id", "id": target}
-    if command == "/done":
-        if len(parts) < 3:
-            return {"command": "done", "ok": False, "error": "expected '/done task <id>'"}
-        target = parts[1].strip().lower()
-        if target != "task":
-            return {"command": "done", "ok": False, "error": "target must be task"}
-        item_id = " ".join(parts[2:]).strip()
-        if not item_id:
-            return {"command": "done", "ok": False, "error": "missing id"}
-        return {"command": "done", "ok": True, "target": target, "id": item_id}
     if command == "/plan":
         instruction = body[len(parts[0]) :].strip()
         if not instruction:
