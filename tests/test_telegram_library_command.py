@@ -569,6 +569,38 @@ def test_update_personal_todo_time_preserves_existing_title_and_date(monkeypatch
     assert "마감 04/29 12:00" in listing_after_update
 
 
+def test_update_personal_todo_full_text_preserves_korean_particles(monkeypatch, tmp_path):
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    settings = SimpleNamespace(timezone="Asia/Seoul")
+    db.upsert_task(
+        external_id="personal:jp-presentation",
+        source="personal",
+        due_at="2026-04-29T12:00:00+09:00",
+        title="임시 제목",
+        status="open",
+        metadata_json={"original_text": "임시 제목"},
+        user_id=7,
+    )
+    monkeypatch.setattr(pipeline, "_telegram_assignments_cached_payload_for_user", lambda **_kwargs: {"items": []})
+
+    pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    updated = pipeline._format_telegram_update_personal_todo(
+        index="1",
+        text="대중문화로보는일본문화론 발표(정원)\n  마감 04/29 23:59",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+
+    assert "대중문화로보는일본문화론 발표(정원)" in updated
+    assert "대중문화 보 일본문화론" not in updated
+    assert "마감 04/29 23:59" in updated
+
+
 def test_parse_board_aliases():
     expected = {"command": "lms_board", "ok": True}
     for cmd in ("/board", "/lms_board", "/lmsboard", "/announcements", "/공지"):

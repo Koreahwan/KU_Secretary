@@ -10256,7 +10256,7 @@ def _clean_personal_todo_update_title(text: Any, *, date_token: str = "", time_t
     body = re.sub(r"\b(due|by|at)\b", " ", body, flags=re.IGNORECASE)
     body = re.sub(r"(오늘|내일|모레)", " ", body)
     body = re.sub(r"(마감|기한|날짜|일자|시간|시각)", " ", body)
-    body = re.sub(r"(까지|전까지|으로|로|을|를|은|는|만)", " ", body)
+    body = re.sub(r"(?<![가-힣A-Za-z0-9])(까지|전까지|으로|로|을|를|은|는|만)(?![가-힣A-Za-z0-9])", " ", body)
     body = re.sub(r"(수정|변경|바꿔줘|바꿔|바꾸기|해주세요|해줘)", " ", body)
     return re.sub(r"\s+", " ", body).strip(" -:/")
 
