@@ -69,6 +69,8 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
         return {"command": "assignments", "ok": True}
     if command in {"/board", "/lms_board", "/lmsboard", "/announcements", "/공지"}:
         return {"command": "lms_board", "ok": True}
+    if command in {"/materials", "/material", "/files", "/자료", "/강의자료"}:
+        return {"command": "lms_materials", "ok": True}
     if command == "/start":
         return {"command": "start", "ok": True}
     if command == "/help":

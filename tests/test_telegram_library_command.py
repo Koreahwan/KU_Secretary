@@ -294,6 +294,34 @@ def test_parse_board_aliases():
         assert telegram.parse_command_message(cmd) == expected, cmd
 
 
+def test_parse_materials_aliases():
+    expected = {"command": "lms_materials", "ok": True}
+    for cmd in ("/materials", "/material", "/files", "/자료", "/강의자료"):
+        assert telegram.parse_command_message(cmd) == expected, cmd
+
+
+def test_format_assignments_scans_each_course(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 11, "name": "사이버기술과법"}])
+    monkeypatch.setattr(
+        ku_lms,
+        "get_assignments",
+        lambda s, course_id, *, upcoming_only=False: [
+            {"id": 1, "name": "개별 강의 과제", "due_at": "2026-04-30T14:00:00Z"}
+        ],
+    )
+
+    out = pipeline._format_telegram_assignments()
+    assert "과목별 과제 확인" in out
+    assert "사이버기술과법 | 개별 강의 과제" in out
+
+
 def test_format_lms_board_renders_per_course(monkeypatch):
     monkeypatch.setenv("KU_PORTAL_ID", "uid")
     monkeypatch.setenv("KU_PORTAL_PW", "pw")
@@ -343,6 +371,66 @@ def test_format_lms_board_renders_per_course(monkeypatch):
     assert "공지 2026-04-25 09:00 | 중간고사 공지" in out
     assert "[빅데이터응용보안]" in out
     assert "Q&A 2026-04-26 01:00 | 프로젝트 관련 질문" in out
+
+
+def test_format_lms_board_reads_items_payload_and_more_boards(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 7, "name": "자료 많은 강의"}])
+    monkeypatch.setattr(ku_lms, "get_announcements", lambda s, course_ids: [])
+    monkeypatch.setattr(
+        ku_lms,
+        "list_boards",
+        lambda s, course_id: [
+            {"id": 1, "name": "보드1"},
+            {"id": 2, "name": "보드2"},
+            {"id": 3, "name": "보드3"},
+            {"id": 4, "name": "강의자료실"},
+        ],
+    )
+
+    def fake_posts(s, course_id, board_id, *, page=1, keyword=""):
+        if board_id == 4:
+            return {"items": [{"title": "네번째 보드 자료", "created_at": "2026-04-26T02:00:00Z"}]}
+        return {"items": []}
+
+    monkeypatch.setattr(ku_lms, "list_board_posts", fake_posts)
+    out = pipeline._format_telegram_lms_board()
+    assert "강의자료실 2026-04-26 02:00 | 네번째 보드 자료" in out
+    assert "과목당 최대" in out
+
+
+def test_format_lms_materials_scans_modules_and_boards(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 5, "name": "운영체제"}])
+    monkeypatch.setattr(
+        ku_lms,
+        "get_modules",
+        lambda s, course_id, *, include_items=True: [
+            {"name": "9주차", "items": [{"type": "File", "title": "스케줄링.pdf"}]}
+        ],
+    )
+    monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [{"id": 9, "name": "공지"}])
+    monkeypatch.setattr(
+        ku_lms,
+        "list_board_posts",
+        lambda s, course_id, board_id, *, page=1, keyword="": {
+            "items": [{"title": "보강 자료 업로드"}]
+        },
+    )
+
+    out = pipeline._format_telegram_lms_materials()
+    assert "[KU] 강의자료 위치" in out
+    assert "[운영체제]" in out
+    assert "모듈 File (9주차): 스케줄링.pdf" in out
+    assert "게시판 공지: 보강 자료 업로드" in out
 
 
 def test_format_lms_board_empty(monkeypatch):
@@ -430,6 +518,18 @@ def test_dispatch_lms_board_calls_formatter(monkeypatch):
         chat_id="123", user_id=1,
     )
     assert result == {"ok": True, "message": "stub-board"}
+
+
+def test_dispatch_lms_materials_calls_formatter(monkeypatch):
+    monkeypatch.setattr(pipeline, "_format_telegram_lms_materials", lambda **kwargs: "stub-materials")
+    monkeypatch.setattr(pipeline, "_is_telegram_chat_allowed", lambda *a, **k: True)
+    monkeypatch.setattr(pipeline, "_resolve_user_scope", lambda *a, **k: {"user_id": 1})
+    result = pipeline._execute_telegram_command(
+        settings=object(), db=object(),
+        command_payload={"command": "lms_materials", "ok": True},
+        chat_id="123", user_id=1,
+    )
+    assert result == {"ok": True, "message": "stub-materials"}
 
 
 def test_dispatch_assignments_calls_formatter(monkeypatch):

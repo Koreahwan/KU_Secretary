@@ -150,6 +150,12 @@ TELEGRAM_UCLASS_NOTICE_STALE_HOURS = 48
 TELEGRAM_UOS_NOTICE_LIMIT = 10
 TELEGRAM_ASSISTANT_CHAT_ACTION = "typing"
 TELEGRAM_ASSISTANT_CHAT_ACTION_INTERVAL_SEC = 4.0
+TELEGRAM_LMS_COURSE_SCAN_LIMIT = 20
+TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE = 8
+TELEGRAM_LMS_BOARD_POST_LIMIT_PER_BOARD = 5
+TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT = 16
+TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE = 5
+TELEGRAM_LMS_MESSAGE_SOFT_LIMIT = 3600
 PORTAL_SECURE_STORAGE_MISSING_REASON = "KU portal session missing from secure storage; reconnect required"
 UCLASS_SECURE_STORAGE_MISSING_REASON = "UClass token missing from secure storage; reconnect required"
 UCLASS_RECONNECT_REQUIRED_REASON = "UClass token expired or unavailable; reconnect required"
@@ -9274,14 +9280,71 @@ def _format_telegram_assignments(
     except Exception:
         events = []
 
-    if not todos and not events:
-        return "[KU] 내야 할 과제\n- 마감 임박한 과제가 없습니다."
-
     def _pretty_dt(value: str | None) -> str:
         if not value:
             return ""
         v = value.replace("T", " ")
         return v[:16] if len(v) > 16 else v
+
+    def _assignment_key(item: dict[str, Any]) -> str:
+        assignment = item.get("assignment") if isinstance(item.get("assignment"), dict) else item
+        raw_id = assignment.get("id") or assignment.get("assignment_id") or item.get("assignment_id")
+        if raw_id is not None:
+            return f"id:{raw_id}"
+        url = str(assignment.get("html_url") or assignment.get("url") or item.get("html_url") or "").strip()
+        if url:
+            return f"url:{url}"
+        return "|".join(
+            [
+                str(assignment.get("name") or item.get("title") or "").strip().lower(),
+                str(assignment.get("due_at") or item.get("due_at") or "").strip(),
+            ]
+        )
+
+    seen_assignment_keys = {
+        _assignment_key(item)
+        for item in todos
+        if isinstance(item, dict) and _assignment_key(item)
+    }
+    course_assignment_rows: list[tuple[str, str, str]] = []
+    scanned_courses = 0
+    assignment_scan_failures = 0
+    try:
+        courses = ku_lms.get_courses(session) or []
+    except Exception:
+        courses = []
+        assignment_scan_failures += 1
+    for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+        if not isinstance(course, dict):
+            continue
+        cid, course_name = _lms_course_id_and_name(course)
+        if cid is None:
+            continue
+        scanned_courses += 1
+        try:
+            assignments = ku_lms.get_assignments(session, cid, upcoming_only=True) or []
+        except Exception:
+            assignment_scan_failures += 1
+            continue
+        for assignment in assignments:
+            if not isinstance(assignment, dict):
+                continue
+            key = _assignment_key(assignment)
+            if key and key in seen_assignment_keys:
+                continue
+            if key:
+                seen_assignment_keys.add(key)
+            name = str(assignment.get("name") or assignment.get("title") or "(제목 없음)").strip()
+            due_at = _pretty_dt(str(assignment.get("due_at") or ""))
+            course_assignment_rows.append((course_name, name, due_at))
+
+    if not todos and not events and not course_assignment_rows:
+        lines = ["[KU] 내야 할 과제", "- 마감 임박한 과제가 없습니다."]
+        if scanned_courses:
+            lines.append(f"- 확인: {scanned_courses}개 과목을 직접 확인했습니다.")
+        if assignment_scan_failures:
+            lines.append(f"- 참고: 일부 과목 조회 실패 {assignment_scan_failures}건")
+        return "\n".join(lines)
 
     lines = ["[KU] 내야 할 과제"]
 
@@ -9297,6 +9360,18 @@ def _format_telegram_assignments(
                 row += f" | 마감 {due_at}"
             lines.append(row)
 
+    if course_assignment_rows:
+        lines.append("")
+        lines.append(f"과목별 과제 확인 ({len(course_assignment_rows)}건, {scanned_courses}개 과목 스캔)")
+        for course_name, name, due_at in course_assignment_rows[:TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT]:
+            row = f"- {course_name} | {name}"
+            if due_at:
+                row += f" | 마감 {due_at}"
+            lines.append(row)
+        remaining = len(course_assignment_rows) - TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT
+        if remaining > 0:
+            lines.append(f"- 외 {remaining}건")
+
     if events:
         lines.append("")
         lines.append(f"다가오는 이벤트 ({len(events)}건)")
@@ -9308,7 +9383,45 @@ def _format_telegram_assignments(
                 row += f" | {start}"
             lines.append(row)
 
+    if assignment_scan_failures:
+        lines.append("")
+        lines.append(f"참고: 일부 과목 조회 실패 {assignment_scan_failures}건")
+
     return "\n".join(lines)
+
+
+def _lms_course_id_and_name(course: dict[str, Any]) -> tuple[int | None, str]:
+    cid_raw = course.get("id") or course.get("course_id")
+    try:
+        cid = int(cid_raw)
+    except (TypeError, ValueError):
+        cid = None
+    name = (
+        str(course.get("name") or course.get("course_name") or course.get("course_code") or "")
+        .strip()
+        or (f"course {cid}" if cid is not None else "강의")
+    )
+    return cid, name
+
+
+def _lms_board_posts_from_response(response: Any) -> list[dict[str, Any]]:
+    if isinstance(response, list):
+        return [item for item in response if isinstance(item, dict)]
+    if not isinstance(response, dict):
+        return []
+    for key in ("posts", "items", "results", "data"):
+        value = response.get(key)
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _append_limited_telegram_line(lines: list[str], line: str) -> bool:
+    candidate = "\n".join([*lines, line])
+    if len(candidate) > TELEGRAM_LMS_MESSAGE_SOFT_LIMIT:
+        return False
+    lines.append(line)
+    return True
 
 
 def _format_telegram_lms_board(
@@ -9350,16 +9463,13 @@ def _format_telegram_lms_board(
     course_ids: list[int] = []
     course_name: dict[int, str] = {}
     for c in courses:
-        cid_raw = c.get("id") or c.get("course_id")
-        try:
-            cid = int(cid_raw)
-        except (TypeError, ValueError):
+        cid, nm = _lms_course_id_and_name(c)
+        if cid is None:
             continue
         course_ids.append(cid)
-        nm = (c.get("name") or c.get("course_name") or c.get("course_code") or "").strip() or f"course {cid}"
         course_name[cid] = nm
 
-    course_ids = course_ids[:8]  # cap
+    course_ids = course_ids[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]
 
     try:
         announcements = ku_lms.get_announcements(session, course_ids) or []
@@ -9407,7 +9517,7 @@ def _format_telegram_lms_board(
             boards = ku_lms.list_boards(session, cid) or []
         except Exception:
             boards = []
-        for b in boards[:3]:
+        for b in boards[:TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE]:
             bid_raw = b.get("id") or b.get("board_id")
             try:
                 bid = int(bid_raw)
@@ -9417,12 +9527,8 @@ def _format_telegram_lms_board(
                 resp = ku_lms.list_board_posts(session, cid, bid)
             except Exception:
                 continue
-            posts = (
-                resp.get("posts")
-                if isinstance(resp, dict)
-                else (resp if isinstance(resp, list) else [])
-            ) or []
-            for p in posts[:3]:
+            posts = _lms_board_posts_from_response(resp)
+            for p in posts[:TELEGRAM_LMS_BOARD_POST_LIMIT_PER_BOARD]:
                 title = (p.get("title") or p.get("subject") or "").strip() or "(제목 없음)"
                 when = _pretty_dt(
                     p.get("posted_at") or p.get("created_at") or p.get("date")
@@ -9443,11 +9549,152 @@ def _format_telegram_lms_board(
             prefix = f"- {kind}"
             if when:
                 prefix += f" {when}"
-            lines.append(f"{prefix} | {title}")
+            if not _append_limited_telegram_line(lines, f"{prefix} | {title}"):
+                lines.append("- 외 항목은 길이 제한 때문에 생략했습니다.")
+                return "\n".join(lines)
 
     if not rendered_any:
         lines.append("- 최근 글이 없습니다.")
+    lines.append("")
+    lines.append(
+        f"- 확인: {len(course_ids)}개 과목, 과목당 최대 "
+        f"{TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE}개 게시판을 직접 확인했습니다."
+    )
     return "\n".join(lines)
+
+
+def _format_telegram_lms_materials(
+    *,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    """Render likely LMS material locations by scanning each Canvas course."""
+    from ku_secretary.connectors import ku_lms
+
+    credentials = _resolve_telegram_lms_credentials(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    if credentials is None:
+        return "KU_PORTAL_ID / KU_PORTAL_PW 환경변수가 비어 있습니다."
+    login_id, password = credentials
+
+    try:
+        session = ku_lms.login(user_id=login_id, password=password)
+    except Exception as exc:  # noqa: BLE001
+        return f"LMS 로그인 실패: {exc}"
+
+    try:
+        courses = ku_lms.get_courses(session) or []
+    except Exception as exc:  # noqa: BLE001
+        return f"강의 목록 조회 실패: {exc}"
+    if not courses:
+        return "[KU] 강의자료 위치\n- 등록된 강의가 없습니다."
+
+    lines = ["[KU] 강의자료 위치", ""]
+    scanned_courses = 0
+    module_failures = 0
+    board_failures = 0
+    rendered_any = False
+
+    for course in courses[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+        if not isinstance(course, dict):
+            continue
+        cid, course_name = _lms_course_id_and_name(course)
+        if cid is None:
+            continue
+        scanned_courses += 1
+        course_lines: list[str] = []
+        seen_titles: set[str] = set()
+
+        try:
+            modules = ku_lms.get_modules(session, cid, include_items=True) or []
+        except Exception:
+            modules = []
+            module_failures += 1
+        for module in modules:
+            if not isinstance(module, dict):
+                continue
+            module_name = str(module.get("name") or module.get("title") or "").strip()
+            items = module.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or item.get("name") or "").strip()
+                if not title:
+                    continue
+                item_type = str(item.get("type") or item.get("content_type") or "자료").strip()
+                key = f"{item_type}|{title}".lower()
+                if key in seen_titles:
+                    continue
+                seen_titles.add(key)
+                prefix = f"- 모듈 {item_type}"
+                if module_name:
+                    prefix += f" ({module_name})"
+                course_lines.append(f"{prefix}: {title}")
+                if len(course_lines) >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
+                    break
+            if len(course_lines) >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
+                break
+
+        try:
+            boards = ku_lms.list_boards(session, cid) or []
+        except Exception:
+            boards = []
+            board_failures += 1
+        board_material_lines = 0
+        for board in boards[:TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE]:
+            bid_raw = board.get("id") or board.get("board_id")
+            try:
+                bid = int(bid_raw)
+            except (TypeError, ValueError):
+                continue
+            board_name = str(board.get("name") or board.get("title") or "게시판").strip()
+            try:
+                resp = ku_lms.list_board_posts(session, cid, bid)
+            except Exception:
+                board_failures += 1
+                continue
+            for post in _lms_board_posts_from_response(resp)[:2]:
+                title = str(post.get("title") or post.get("subject") or "").strip()
+                if not title:
+                    continue
+                key = f"{board_name}|{title}".lower()
+                if key in seen_titles:
+                    continue
+                seen_titles.add(key)
+                course_lines.append(f"- 게시판 {board_name}: {title}")
+                board_material_lines += 1
+                if board_material_lines >= 3:
+                    break
+            if board_material_lines >= 3:
+                break
+
+        if not course_lines:
+            continue
+        rendered_any = True
+        if not _append_limited_telegram_line(lines, f"[{course_name}]"):
+            break
+        for row in course_lines:
+            if not _append_limited_telegram_line(lines, row):
+                lines.append("- 외 항목은 길이 제한 때문에 생략했습니다.")
+                return "\n".join(lines)
+        _append_limited_telegram_line(lines, "")
+
+    if not rendered_any:
+        lines.append("- 최근 강의자료 위치를 찾지 못했습니다.")
+    lines.append(
+        f"- 확인: {scanned_courses}개 과목의 모듈과 게시판을 직접 확인했습니다."
+    )
+    if module_failures or board_failures:
+        lines.append(f"- 참고: 모듈 실패 {module_failures}건 / 게시판 실패 {board_failures}건")
+    return "\n".join(lines).rstrip()
 
 
 def _format_telegram_library(query: str | None) -> str:
@@ -10169,6 +10416,7 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "library", "description": "도서관 좌석 현황 보기"},
         {"command": "assignments", "description": "내야 할 과제 목록 보기"},
         {"command": "board", "description": "과목별 게시판/공지 모음 보기"},
+        {"command": "materials", "description": "과목별 강의자료 위치 보기"},
         {"command": "inbox", "description": "임시 draft 목록 보기"},
         {"command": "apply", "description": "inbox draft 반영하기"},
         {"command": "done", "description": "과제 완료 처리하기"},
@@ -10289,6 +10537,7 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /library [도서관명] : 도서관 좌석 현황 (예: /library 중앙도서관)",
         "- /assignments : 마감 임박한 LMS 과제와 이벤트 (별칭: /due /homework /과제)",
         "- /board : 과목별 LMS 공지/게시판 최근 글 (별칭: /announcements /공지)",
+        "- /materials : 과목별 LMS 모듈/게시판 강의자료 위치 (별칭: /자료 /강의자료)",
         "- /status : 현재 동기화 상태",
         *assistant_lines,
         *smart_lines,
@@ -11040,6 +11289,16 @@ def _execute_telegram_command(
         return {
             "ok": True,
             "message": _format_telegram_lms_board(
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
+        }
+    if command == "lms_materials":
+        return {
+            "ok": True,
+            "message": _format_telegram_lms_materials(
                 settings=settings,
                 db=db,
                 user_id=user_id,
