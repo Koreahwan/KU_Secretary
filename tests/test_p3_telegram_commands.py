@@ -58,8 +58,8 @@ def test_sync_telegram_registers_bot_menu_commands(
     commands = registered_commands[0]
     assert {"command": "today", "description": "오늘 일정과 마감 보기"} in commands
     assert {"command": "tomorrow", "description": "내일 일정과 마감 보기"} in commands
-    assert {"command": "weather", "description": "오늘/내일 날씨 보기"} in commands
-    assert {"command": "region", "description": "날씨 지역 설정"} in commands
+    assert {"command": "weather", "description": "오늘/내일 날씨 보기"} not in commands
+    assert {"command": "region", "description": "날씨 지역 설정"} not in commands
     assert {"command": "todaysummary", "description": "오늘 수업 자료 요약 보기"} in commands
     assert {"command": "tomorrowsummary", "description": "내일 수업 자료 요약 보기"} in commands
     assert {"command": "notice_uclass", "description": "온라인강의실 최근 알림 보기"} in commands
@@ -281,7 +281,7 @@ def test_format_telegram_help_and_start_expose_only_bot_for_assistant(
     assert "/setup" not in help_message
     assert "/assistant" not in help_message
     assert "/asis" not in help_message
-    assert "/bot 오늘 일정이랑 날씨 알려줘" in start_message
+    assert "/bot 오늘 일정 알려줘" in start_message
     assert "/assistant" not in start_message
     assert "/asis" not in start_message
 
@@ -2302,76 +2302,10 @@ def test_sync_telegram_tomorrowsummary_command_returns_class_briefs(
     assert "coding.pdf" in message
 
 
-def test_sync_telegram_todayweather_command_returns_weather_snapshot(
-    tmp_path: Path, monkeypatch
-) -> None:
+def test_sync_telegram_weather_command_is_removed(tmp_path: Path, monkeypatch) -> None:
     db = Database(tmp_path / "ku.db")
     db.init()
     sent_messages: list[tuple[str, str]] = []
-
-    db.update_sync_state(
-        "sync_weather",
-        last_run_at="2026-03-09T06:00:00+00:00",
-        last_cursor_json={
-            "generated_at": "2026-03-09T15:00:00+09:00",
-            "location_label": "고려대",
-            "current": {
-                "temperature_c": 7.6,
-                "condition_text": "맑음",
-            },
-            "air_quality": {
-                "ok": True,
-                "provider": "seoul_openapi",
-                "measured_at": "2026-03-09T15:00:00+09:00",
-                "districts": [
-                    {
-                        "district_code": "111152",
-                        "district_name": "동대문구",
-                        "cai_grade": "보통",
-                        "dominant_pollutant": "PM-2.5",
-                        "pm10": 56,
-                        "pm25": 37,
-                    },
-                    {
-                        "district_code": "111171",
-                        "district_name": "도봉구",
-                        "cai_grade": "보통",
-                        "dominant_pollutant": "PM-2.5",
-                        "pm10": 58,
-                        "pm25": 36,
-                    },
-                ],
-            },
-            "today": {
-                "date": datetime.now(ZoneInfo("Asia/Seoul")).date().isoformat(),
-                "temperature_min_c": 2.0,
-                "temperature_max_c": 13.0,
-                "diurnal_range_c": 11.0,
-                "diurnal_range_alert": True,
-                "morning": {
-                    "label": "오전",
-                    "temperature_min_c": 2.0,
-                    "temperature_max_c": 8.0,
-                    "condition_text": "맑음",
-                    "precip_probability_max": 10,
-                },
-                "afternoon": {
-                    "label": "오후",
-                    "temperature_min_c": 9.0,
-                    "temperature_max_c": 13.0,
-                    "condition_text": "구름많음",
-                    "precip_probability_max": 20,
-                },
-            },
-            "tomorrow": {
-                "date": (datetime.now(ZoneInfo("Asia/Seoul")).date() + timedelta(days=1)).isoformat(),
-                "temperature_min_c": 4.0,
-                "temperature_max_c": 11.0,
-                "diurnal_range_c": 7.0,
-                "diurnal_range_alert": False,
-            },
-        },
-    )
 
     class FakeTelegram:
         def __init__(self, bot_token: str, timeout_sec: int = 30):
@@ -2408,19 +2342,9 @@ def test_sync_telegram_todayweather_command_returns_weather_snapshot(
     result = pipeline.sync_telegram(settings=settings, db=db)
 
     assert result["commands"]["processed"] == 1
+    assert result["commands"]["failed"] == 1
     assert len(sent_messages) == 1
-    message = sent_messages[0][1]
-    assert message.startswith("오늘 날씨 (")
-    assert "오늘 날씨 (15:00 기준)" in message
-    assert "현재 7.6C / 맑음" in message
-    assert "오전 : 2~8C, 맑음, 강수확률 10%" in message
-    assert "오후 : 9~13C, 구름많음, 강수확률 20%" in message
-    assert "\n미세먼지 (15:00 기준)\n" in message
-    assert "동대문구 나쁨" in message
-    assert "도봉구 나쁨" in message
-    assert "\n내일 날씨\n" in message
-    assert "최저 4C / 최고 11C" in message
-    assert "갱신:" not in message
+    assert sent_messages[0] == ("12345", "unsupported command: /weather")
 
 
 def test_format_telegram_tomorrowweather_focuses_on_forecast_snapshot(tmp_path: Path) -> None:
@@ -2478,12 +2402,13 @@ def test_format_telegram_tomorrowweather_focuses_on_forecast_snapshot(tmp_path: 
     assert "미세먼지" not in message
 
 
-def test_sync_telegram_region_command_stores_user_weather_location(
+def test_sync_telegram_region_command_is_removed(
     tmp_path: Path, monkeypatch
 ) -> None:
     db = Database(tmp_path / "ku.db")
     db.init()
     sent_messages: list[tuple[str, str]] = []
+    location_queries: list[str] = []
 
     class FakeTelegram:
         def __init__(self, bot_token: str, timeout_sec: int = 30):
@@ -2512,13 +2437,7 @@ def test_sync_telegram_region_command_stores_user_weather_location(
     monkeypatch.setattr(
         pipeline,
         "resolve_weather_location_query",
-        lambda query: {
-            "label": "동대문구",
-            "lat": 37.5744,
-            "lon": 127.0396,
-            "air_quality_district_code": "111152",
-            "source": "catalog",
-        },
+        lambda query: location_queries.append(str(query)),
     )
     settings = SimpleNamespace(
         telegram_enabled=True,
@@ -2534,68 +2453,19 @@ def test_sync_telegram_region_command_stores_user_weather_location(
     preferences = db.get_user_preferences(chat_id="12345")
 
     assert result["commands"]["processed"] == 1
-    assert preferences is not None
-    assert preferences["weather_location_label"] == "동대문구"
-    assert preferences["weather_lat"] == 37.5744
-    assert preferences["weather_lon"] == 127.0396
-    assert preferences["weather_air_quality_district_code"] == "111152"
-    assert sent_messages[0][0] == "12345"
-    assert "저장됨: 동대문구" in sent_messages[0][1]
-    assert "/region reset" in sent_messages[0][1]
+    assert result["commands"]["failed"] == 1
+    assert preferences is None
+    assert location_queries == []
+    assert sent_messages == [("12345", "unsupported command: /region")]
 
 
-def test_sync_telegram_weather_command_uses_user_specific_regions_for_two_users(
+def test_sync_telegram_weather_command_removed_for_multiple_users(
     tmp_path: Path, monkeypatch
 ) -> None:
     db = Database(tmp_path / "ku.db")
     db.init()
-    db.upsert_user_preferences(
-        chat_id="111",
-        weather_location_label="동대문구",
-        weather_lat=37.5744,
-        weather_lon=127.0396,
-    )
-    db.upsert_user_preferences(
-        chat_id="222",
-        weather_location_label="도봉구",
-        weather_lat=37.6688,
-        weather_lon=127.0471,
-    )
     sent_messages: list[tuple[str, str]] = []
     weather_calls: list[tuple[str, float, float]] = []
-
-    def _snapshot(label: str, temperature: float, condition: str) -> dict[str, object]:
-        today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-        return {
-            "generated_at": "2026-03-09T15:00:00+09:00",
-            "location_label": label,
-            "current": {
-                "temperature_c": temperature,
-                "condition_text": condition,
-            },
-            "today": {
-                "date": today.isoformat(),
-                "morning": {
-                    "label": "오전",
-                    "temperature_min_c": temperature - 2,
-                    "temperature_max_c": temperature,
-                    "condition_text": condition,
-                    "precip_probability_max": 10,
-                },
-                "afternoon": {
-                    "label": "오후",
-                    "temperature_min_c": temperature + 1,
-                    "temperature_max_c": temperature + 3,
-                    "condition_text": condition,
-                    "precip_probability_max": 20,
-                },
-            },
-            "tomorrow": {
-                "date": (today + timedelta(days=1)).isoformat(),
-                "temperature_min_c": temperature - 1,
-                "temperature_max_c": temperature + 2,
-            },
-        }
 
     class FakeWeatherClient:
         def __init__(self, auth_key=None):
@@ -2603,9 +2473,7 @@ def test_sync_telegram_weather_command_uses_user_specific_regions_for_two_users(
 
         def fetch_snapshot(self, *, lat, lon, location_label, timezone_name, now_local=None):
             weather_calls.append((str(location_label), float(lat), float(lon)))
-            if str(location_label) == "동대문구":
-                return _snapshot("동대문구", 7.0, "맑음")
-            return _snapshot("도봉구", 3.0, "흐림")
+            raise AssertionError("removed /weather command must not call weather API")
 
     class FakeTelegram:
         def __init__(self, bot_token: str, timeout_sec: int = 30):
@@ -2660,11 +2528,12 @@ def test_sync_telegram_weather_command_uses_user_specific_regions_for_two_users(
     messages = {chat_id: text for chat_id, text in sent_messages}
 
     assert result["commands"]["processed"] == 2
-    assert len(weather_calls) == 2
-    assert "- 지역 동대문구" in messages["111"]
-    assert "현재 7C / 맑음" in messages["111"]
-    assert "- 지역 도봉구" in messages["222"]
-    assert "현재 3C / 흐림" in messages["222"]
+    assert result["commands"]["failed"] == 2
+    assert weather_calls == []
+    assert messages == {
+        "111": "unsupported command: /weather",
+        "222": "unsupported command: /weather",
+    }
 
 
 def test_sync_weather_reuses_shared_user_region_snapshot(

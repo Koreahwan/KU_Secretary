@@ -94,19 +94,10 @@ def test_execute_assistant_plan_delegates_query_reply(
     assert result["action_results"][0]["capability"] == "query_today"
 
 
-def test_execute_assistant_plan_delegates_tomorrow_weather_reply(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def test_execute_assistant_plan_rejects_removed_weather_capability(tmp_path: Path) -> None:
     db = Database(tmp_path / "ku.db")
     db.init()
     db.ensure_user_for_chat(chat_id="12345", timezone_name="Asia/Seoul")
-
-    monkeypatch.setattr(
-        pipeline,
-        "_format_telegram_tomorrowweather",
-        lambda settings, db, user_id=None, chat_id=None: "[KU] 내일 날씨\n\n- 테스트 예보",
-    )
 
     result = execute_assistant_plan(
         _settings(),
@@ -128,30 +119,15 @@ def test_execute_assistant_plan_delegates_tomorrow_weather_reply(
         chat_id="12345",
     )
 
-    assert result["ok"] is True
-    assert result["reply"] == "[KU] 내일 날씨\n\n- 테스트 예보"
-    assert result["action_results"][0]["capability"] == "query_tomorrow_weather"
+    assert result["ok"] is False
+    assert result["error"] == "invalid_plan"
+    assert "intent must be one of" in result["errors"][0]
 
 
-def test_execute_assistant_plan_updates_weather_region_and_notification_policy(
-    tmp_path: Path,
-    monkeypatch,
-) -> None:
+def test_execute_assistant_plan_updates_notification_policy(tmp_path: Path) -> None:
     db = Database(tmp_path / "ku.db")
     db.init()
     user = db.ensure_user_for_chat(chat_id="12345", timezone_name="Asia/Seoul")
-
-    monkeypatch.setattr(
-        pipeline,
-        "resolve_weather_location_query",
-        lambda query: {
-            "label": "동대문구",
-            "lat": 37.5744,
-            "lon": 127.0396,
-            "air_quality_district_code": "111152",
-            "source": "test",
-        },
-    )
 
     result = execute_assistant_plan(
         _settings(),
@@ -160,11 +136,6 @@ def test_execute_assistant_plan_updates_weather_region_and_notification_policy(
             "intent": "multi_action",
             "confidence": 0.88,
             "actions": [
-                {
-                    "version": ACTION_SCHEMA_VERSION,
-                    "capability": "set_weather_region",
-                    "arguments": {"region_query": "동대문구"},
-                },
                 {
                     "version": ACTION_SCHEMA_VERSION,
                     "capability": "set_notification_policy",
@@ -184,12 +155,9 @@ def test_execute_assistant_plan_updates_weather_region_and_notification_policy(
         chat_id="12345",
     )
 
-    preferences = db.get_user_preferences(chat_id="12345")
     policy = db.get_notification_policy("daily_digest", chat_id="12345")
 
     assert result["ok"] is True
-    assert preferences["weather_location_label"] == "동대문구"
-    assert preferences["weather_air_quality_district_code"] == "111152"
     assert policy["enabled"] is True
     assert policy["days_of_week_json"] == ["mon", "wed"]
     assert policy["time_local"] == "08:30"

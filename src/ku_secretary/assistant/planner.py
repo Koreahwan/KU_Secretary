@@ -38,7 +38,6 @@ ASSISTANT_PLANNER_SYSTEM_PROMPT = (
     "confidence must be a number between 0 and 1. "
     f"Each item in actions must be a valid {ACTION_SCHEMA_VERSION} action object. "
     f"Use only capabilities from registry version {CAPABILITY_REGISTRY_VERSION}. "
-    "Requests about tomorrow's weather or forecast must use query_tomorrow_weather. "
     "Requests about tomorrow's schedule, classes, or deadlines must use query_tomorrow. "
     "If the request is ambiguous, unsupported, or missing required details, "
     "set intent to needs_clarification, confidence to 0.4 or lower, actions to [], "
@@ -101,14 +100,14 @@ def _fallback_plan(*, reason: str) -> dict[str, Any]:
     if reason == "ambiguous":
         reply = (
             "무엇을 도와드릴지 조금 더 구체적으로 말씀해 주세요. "
-            "예: 오늘 일정, 내일 일정, 날씨, 날씨 지역 설정, 리마인더 생성."
+            "예: 오늘 일정, 내일 일정, 과제 확인, 리마인더 생성."
         )
     elif reason == "disabled":
         reply = "지금은 자연어 planner를 사용할 수 없습니다. 요청을 더 구체적으로 적어 주세요."
     else:
         reply = (
             "요청을 안전하게 해석하지 못했습니다. "
-            "예: 오늘 일정 보여줘, 내일 날씨 알려줘, 내일 오전 8시에 과제 제출 알림해줘."
+            "예: 오늘 일정 보여줘, 내일 과제 알려줘, 내일 오전 8시에 과제 제출 알림해줘."
         )
     return {
         "intent": "needs_clarification",

@@ -7000,8 +7000,6 @@ def _format_telegram_todayweather(
                 "- 아직 날씨 데이터가 준비되지 않았습니다.",
                 f"- 현재 지역: {location_label}",
                 "- 첫 동기화 전이거나 데이터가 아직 갱신되지 않았습니다.",
-                "- 지역 변경: `/region 고려대`",
-                "- 기본값 복귀: `/region reset`",
             ]
         )
     timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
@@ -7042,8 +7040,6 @@ def _format_telegram_tomorrowweather(
                 "- 아직 내일 날씨 데이터가 준비되지 않았습니다.",
                 f"- 현재 지역: {location_label}",
                 "- 첫 동기화 전이거나 데이터가 아직 갱신되지 않았습니다.",
-                "- 지역 변경: `/region 고려대`",
-                "- 기본값 복귀: `/region reset`",
             ]
         )
 
@@ -7116,15 +7112,7 @@ def _format_weather_region_status(
         lines.append(
             f"- 현재 설정: 기본값 ({str(default_target.get('location_label') or '서울특별시')})"
         )
-    lines.extend(
-        [
-            "- 반영 대상: /weather, 아침/저녁 브리핑",
-            "- 변경 예: /region 고려대",
-            "- 변경 예: /region 동대문구",
-            "- 직접 지정: /region 37.5665,126.9780 서울시청",
-            "- 기본값 복귀: /region reset",
-        ]
-    )
+    lines.append("- 날씨 지역 명령은 현재 Telegram 메뉴에서 제거되었습니다.")
     return "\n".join(lines)
 
 
@@ -7139,7 +7127,7 @@ def _handle_telegram_region_command(
     owner_id = _safe_int(user_id)
     chat = str(chat_id or "").strip() or None
     if owner_id is None and not chat:
-        return {"ok": False, "error": "user scope missing for /region"}
+        return {"ok": False, "error": "user scope missing for weather region command"}
 
     raw_query = str(query or "").strip()
     if not raw_query:
@@ -7171,7 +7159,7 @@ def _handle_telegram_region_command(
                     "[KU] 날씨 지역",
                     "",
                     f"- 기본값으로 되돌렸습니다: {default_target['location_label']}",
-                    "- 이제 /weather 와 아침/저녁 브리핑에 기본 지역을 사용합니다.",
+                    "- 기본 지역 설정을 사용합니다.",
                 ]
             ),
         }
@@ -7232,8 +7220,7 @@ def _handle_telegram_region_command(
                 "[KU] 날씨 지역",
                 "",
                 f"- 저장됨: {label}",
-                "- 이제 /weather 와 아침/저녁 브리핑에 이 지역을 사용합니다.",
-                "- 기본값으로 돌아가려면 /region reset",
+                "- 이 지역 설정을 사용합니다.",
             ]
         ),
     }
@@ -11258,7 +11245,7 @@ def _render_telegram_setup_message(
     elif not state.core_ready:
         lines.append("- `/setup` 결과를 확인한 뒤 필요하면 `/connect`로 다시 연결하세요.")
     else:
-        lines.append("- 핵심 연결은 준비됐습니다. `/today`와 `/weather`를 사용해 보세요.")
+        lines.append("- 핵심 연결은 준비됐습니다. `/today`와 `/assignments`를 사용해 보세요.")
 
     _append_message_section(lines, "현재 연결")
     if state.uclass_labels:
@@ -11287,8 +11274,8 @@ def _render_telegram_setup_message(
             "- /connect",
             "- /today",
             "- /tomorrow",
-            "- /weather",
-            "- /region 고려대",
+            "- /assignments",
+            "- /week",
             "- /todaysummary",
             "- /tomorrowsummary",
             "- /notice_uclass",
@@ -11466,8 +11453,6 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "status", "description": "동기화 상태 보기"},
         {"command": "today", "description": "오늘 일정과 마감 보기"},
         {"command": "tomorrow", "description": "내일 일정과 마감 보기"},
-        {"command": "weather", "description": "오늘/내일 날씨 보기"},
-        {"command": "region", "description": "날씨 지역 설정"},
         {"command": "todaysummary", "description": "오늘 수업 자료 요약 보기"},
         {"command": "tomorrowsummary", "description": "내일 수업 자료 요약 보기"},
         {"command": "notice_uclass", "description": "온라인강의실 최근 알림 보기"},
@@ -11575,7 +11560,7 @@ def _format_telegram_help(settings: Settings) -> str:
     if bool(getattr(settings, "telegram_assistant_enabled", False)):
         assistant_lines = [
             "- /bot <자연어> : 자연어 비서",
-            "- 예: /bot 오늘 일정이랑 날씨 알려줘",
+            "- 예: /bot 오늘 일정 알려줘",
         ]
     smart_lines: list[str] = []
     if bool(getattr(settings, "telegram_smart_commands_enabled", False)):
@@ -11589,8 +11574,6 @@ def _format_telegram_help(settings: Settings) -> str:
         "기본 명령",
         "- /today : 오늘 일정과 마감 과제",
         "- /tomorrow : 내일 일정과 마감 과제",
-        "- /weather : 오늘/내일 날씨",
-        "- /region <지역명> : 날씨 지역 설정",
         "- /todaysummary : 오늘 수업 자료 요약",
         "- /tomorrowsummary : 내일 수업 자료 요약",
         "- /notice_uclass : 온라인강의실 최근 알림",
@@ -11639,7 +11622,6 @@ def _format_telegram_start(
         "- 자연어 비서",
         "- 고려대 공식 시간표 동기화",
         "- 아침/저녁 브리핑",
-        "- 오늘/내일 날씨와 미세먼지",
         "- 강의자료 요약과 과제 마감 확인",
         "- 온라인강의실/KU 공지 확인",
     ]
@@ -11662,7 +11644,7 @@ def _format_telegram_start(
         ]
     )
     if bool(getattr(settings, "telegram_assistant_enabled", False)):
-        lines.append("- /bot 오늘 일정이랑 날씨 알려줘")
+        lines.append("- /bot 오늘 일정 알려줘")
     if bool(getattr(settings, "telegram_smart_commands_enabled", False)):
         lines.append("- /plan 내일 오전 8시에 과제 제출 알림")
     if chat_connections:
@@ -12046,7 +12028,7 @@ def _format_telegram_assistant_usage() -> str:
             "[KU] 자연어 비서",
             "",
             "- `/bot <요청>` 형식으로 보내 주세요.",
-            "- 예: `/bot 오늘 일정이랑 날씨 알려줘`",
+            "- 예: `/bot 오늘 일정 알려줘`",
             "- 예: `/bot 내일 오전 8시에 과제 제출 알림해줘`",
         ]
     )
@@ -12306,24 +12288,6 @@ def _execute_telegram_command(
         return {"ok": True, "message": _format_telegram_today(settings, db, user_id=user_id)}
     if command == "tomorrow":
         return {"ok": True, "message": _format_telegram_tomorrow(settings, db, user_id=user_id)}
-    if command == "region":
-        return _handle_telegram_region_command(
-            settings,
-            db,
-            query=command_payload.get("query"),
-            chat_id=chat_id,
-            user_id=user_id,
-        )
-    if command in {"weather", "todayweather"}:
-        return {
-            "ok": True,
-            "message": _format_telegram_todayweather(
-                settings,
-                db,
-                user_id=user_id,
-                chat_id=chat_id,
-            ),
-        }
     if command == "today_summary":
         return {"ok": True, "message": _format_telegram_today_summary(settings, db, user_id=user_id)}
     if command == "tomorrow_summary":

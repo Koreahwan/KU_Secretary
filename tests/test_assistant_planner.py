@@ -65,7 +65,7 @@ def test_plan_assistant_request_accepts_valid_llm_json(monkeypatch) -> None:
     assert ACTION_SCHEMA_VERSION in called["prompt"]
 
 
-def test_plan_assistant_request_accepts_tomorrow_weather_intent(monkeypatch) -> None:
+def test_plan_assistant_request_rejects_removed_weather_intent(monkeypatch) -> None:
     called: dict[str, str] = {}
 
     class FakeClient:
@@ -97,10 +97,11 @@ def test_plan_assistant_request_accepts_tomorrow_weather_intent(monkeypatch) -> 
         now=datetime(2026, 4, 1, 19, 0, 0),
     )
 
-    assert result["mode"] == "llm"
-    assert result["intent"] == "query_tomorrow_weather"
-    assert result["actions"][0]["capability"] == "query_tomorrow_weather"
-    assert "tomorrow's weather or forecast must use query_tomorrow_weather" in called["system_prompt"]
+    assert result["mode"] == "fallback_invalid_plan"
+    assert result["intent"] == "needs_clarification"
+    assert result["actions"] == []
+    assert "query_tomorrow_weather" not in called["prompt"]
+    assert "weather or forecast" not in called["system_prompt"]
 
 
 def test_plan_assistant_request_falls_back_on_invalid_json(monkeypatch) -> None:

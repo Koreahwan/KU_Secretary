@@ -41,14 +41,6 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
         return {"command": "today", "ok": True}
     if command == "/tomorrow":
         return {"command": "tomorrow", "ok": True}
-    if command in {"/weather", "/todayweather"}:
-        return {"command": "weather", "ok": True}
-    if command in {"/region", "/setregion"}:
-        query = body[len(parts[0]) :].strip()
-        payload = {"command": "region", "ok": True}
-        if query:
-            payload["query"] = query
-        return payload
     if command in {"/todaysummary", "/todaybrief"}:
         return {"command": "today_summary", "ok": True}
     if command in {"/tomorrowsummary", "/tomorrowbrief"}:

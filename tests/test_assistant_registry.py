@@ -17,9 +17,6 @@ def test_capability_registry_serialization_contains_required_capabilities() -> N
     assert [item["name"] for item in payload["capabilities"]] == [
         "query_today",
         "query_tomorrow",
-        "query_weather",
-        "query_tomorrow_weather",
-        "set_weather_region",
         "create_one_time_reminder",
         "set_notification_policy",
         "explain_capability",

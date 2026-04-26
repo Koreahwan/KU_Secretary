@@ -111,28 +111,6 @@ def _execute_query_action(
             "capability": capability,
             "reply": pipeline._format_telegram_tomorrow(settings, db, user_id=user_id),
         }
-    if capability == "query_weather":
-        return {
-            "ok": True,
-            "capability": capability,
-            "reply": pipeline._format_telegram_todayweather(
-                settings,
-                db,
-                user_id=user_id,
-                chat_id=chat_id,
-            ),
-        }
-    if capability == "query_tomorrow_weather":
-        return {
-            "ok": True,
-            "capability": capability,
-            "reply": pipeline._format_telegram_tomorrowweather(
-                settings,
-                db,
-                user_id=user_id,
-                chat_id=chat_id,
-            ),
-        }
     if capability == "explain_capability":
         target_name = str(arguments.get("capability_name") or "").strip()
         target = get_capability(target_name)
@@ -168,21 +146,6 @@ def _execute_mutation_action(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     from ku_secretary.jobs import pipeline
-
-    if capability == "set_weather_region":
-        result = pipeline._handle_telegram_region_command(
-            settings,
-            db,
-            query=str(arguments.get("region_query") or "").strip(),
-            user_id=user_id,
-            chat_id=chat_id,
-        )
-        return {
-            "ok": bool(result.get("ok")),
-            "capability": capability,
-            "reply": str(result.get("message") or "").strip(),
-            "error": result.get("error"),
-        }
 
     if capability == "create_one_time_reminder":
         owner_id, resolved_chat = _resolve_scope(db, user_id=user_id, chat_id=chat_id)

@@ -151,32 +151,12 @@ def test_parse_command_message_tomorrow_commands() -> None:
     assert parsed["command"] == "tomorrow_summary"
 
 
-def test_parse_command_message_todayweather() -> None:
-    parsed = parse_command_message("/todayweather")
-    assert parsed is not None
-    assert parsed["ok"] is True
-    assert parsed["command"] == "weather"
-
-
-def test_parse_command_message_weather() -> None:
-    parsed = parse_command_message("/weather")
-    assert parsed is not None
-    assert parsed["ok"] is True
-    assert parsed["command"] == "weather"
-
-
-def test_parse_command_message_region() -> None:
-    parsed = parse_command_message("/region 동대문구")
-    assert parsed is not None
-    assert parsed["ok"] is True
-    assert parsed["command"] == "region"
-    assert parsed["query"] == "동대문구"
-
-    reset = parse_command_message("/setregion reset")
-    assert reset is not None
-    assert reset["ok"] is True
-    assert reset["command"] == "region"
-    assert reset["query"] == "reset"
+def test_parse_command_message_weather_commands_removed() -> None:
+    for text in ("/todayweather", "/weather", "/region 동대문구", "/setregion reset"):
+        parsed = parse_command_message(text)
+        assert parsed is not None
+        assert parsed["ok"] is False
+        assert parsed["command"] == "unknown"
 
 
 def test_parse_command_message_notice_commands() -> None:

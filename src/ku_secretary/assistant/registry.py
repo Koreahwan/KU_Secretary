@@ -159,32 +159,6 @@ _BASE_CAPABILITIES: tuple[CapabilityDefinition, ...] = (
         side_effect=False,
     ),
     CapabilityDefinition(
-        name="query_weather",
-        category="query",
-        summary="Read the user's current weather summary and forecast snapshot.",
-        side_effect=False,
-    ),
-    CapabilityDefinition(
-        name="query_tomorrow_weather",
-        category="query",
-        summary="Read tomorrow's forecast and weather outlook for the user.",
-        side_effect=False,
-    ),
-    CapabilityDefinition(
-        name="set_weather_region",
-        category="mutation",
-        summary="Update the user's default weather region or district.",
-        side_effect=True,
-        fields=(
-            ActionFieldDefinition(
-                name="region_query",
-                field_type="string",
-                description="Natural-language region name or district query.",
-                required=True,
-            ),
-        ),
-    ),
-    CapabilityDefinition(
         name="create_one_time_reminder",
         category="mutation",
         summary="Create a single reminder at one local datetime.",
