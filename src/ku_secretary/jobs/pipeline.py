@@ -10268,6 +10268,21 @@ def _telegram_todo_cached_payload_for_user(
     )
 
 
+def _clear_telegram_todo_cache(
+    db: Database | None,
+    *,
+    user_id: int | None,
+    chat_id: str | int | None,
+) -> None:
+    if db is None:
+        return
+    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
+    try:
+        db.update_sync_state(job_name, last_run_at=None, last_cursor_json={}, user_id=user_id)
+    except Exception:
+        logger.debug("failed to clear telegram todo cache", exc_info=True)
+
+
 def _format_telegram_todo(
     *,
     settings: Settings | None = None,
@@ -10419,7 +10434,15 @@ def _format_telegram_todo(
         lines.append("")
     while lines and lines[-1] == "":
         lines.pop()
-    lines.extend(["", "상세: /task <번호>", "개인 할일 추가: /add <내용>", "개인 완료: /done <번호>"])
+    lines.extend(
+        [
+            "",
+            "상세: /task <번호>",
+            "수정: /task <번호> <새 내용>",
+            "개인 할일 추가: /add <내용>",
+            "개인 완료: /done <번호>",
+        ]
+    )
 
     message = "\n".join(lines)
     _store_cached_telegram_assignments(
@@ -10482,7 +10505,7 @@ def _format_telegram_todo_detail(
         original_text = _truncate_lms_text(item.get("original_text") or "", 500)
         if original_text and original_text != str(item.get("title") or "").strip():
             lines.extend(["", "입력", original_text])
-        lines.extend(["", f"완료: /done {target_index}"])
+        lines.extend(["", f"수정: /task {target_index} <새 내용>", f"완료: /done {target_index}"])
     else:
         evidence = _truncate_lms_text(item.get("evidence") or "", 700)
         if evidence:
@@ -10528,14 +10551,80 @@ def _format_telegram_add_personal_todo(
         },
         user_id=user_id,
     )
-    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
-    try:
-        db.update_sync_state(job_name, last_run_at=None, last_cursor_json={}, user_id=user_id)
-    except Exception:
-        logger.debug("failed to clear telegram todo cache", exc_info=True)
+    _clear_telegram_todo_cache(db, user_id=user_id, chat_id=chat_id)
     lines = ["[KU] 개인 할일 추가", "", title]
     if due_at:
         lines.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+    lines.extend(["", "확인: /todo"])
+    return "\n".join(lines)
+
+
+def _format_telegram_update_personal_todo(
+    *,
+    index: Any,
+    text: Any,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    if db is None:
+        return "개인 할일 저장소를 사용할 수 없습니다."
+    try:
+        target_index = int(str(index or "").strip())
+    except (TypeError, ValueError):
+        return "사용법: /task <번호> <새 내용>"
+    new_text = str(text or "").strip()
+    if not new_text:
+        return "사용법: /task <번호> <새 내용>"
+    payload = _telegram_todo_cached_payload_for_user(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+        allow_refresh=False,
+    )
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return "수정할 할일 캐시가 없습니다. 먼저 /todo 를 실행하세요."
+    item = next(
+        (row for row in items if isinstance(row, dict) and int(row.get("index") or 0) == target_index),
+        None,
+    )
+    if item is None:
+        return f"{target_index}번 할일을 찾지 못했습니다. /todo 에 표시된 번호를 사용하세요."
+    if item.get("kind") != "personal":
+        return "LMS 과제는 직접 수정하지 않습니다. LMS에서 읽은 제출/마감 정보를 그대로 보여줍니다."
+    selector = str(item.get("task_selector") or "").strip()
+    current = db.get_task_for_selector(selector, user_id=user_id)
+    if current is None or str(current.get("source") or "").strip().lower() != "personal":
+        return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    title, due_at = _parse_personal_todo_text(new_text, timezone_name=timezone_name)
+    metadata = _json_load(current.get("metadata_json"))
+    metadata.update(
+        {
+            "kind": "personal",
+            "updated_via": "telegram",
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "previous_title": str(current.get("title") or "").strip(),
+            "previous_due_at": str(current.get("due_at") or "").strip(),
+            "original_text": new_text,
+        }
+    )
+    updated = db.upsert_task(
+        external_id=str(current.get("external_id") or selector),
+        source="personal",
+        due_at=due_at,
+        title=title,
+        status=str(current.get("status") or "open"),
+        metadata_json=metadata,
+        user_id=user_id,
+    )
+    _clear_telegram_todo_cache(db, user_id=user_id, chat_id=chat_id)
+    lines = ["[KU] 개인 할일 수정", "", updated.title]
+    if updated.due_at:
+        lines.append(f"마감 {_format_lms_list_dt(updated.due_at, timezone_name=timezone_name)}")
     lines.extend(["", "확인: /todo"])
     return "\n".join(lines)
 
@@ -10579,11 +10668,7 @@ def _format_telegram_done_personal_todo(
     updated = db.update_task_status(selector, "done", user_id=user_id)
     if updated is None:
         return "개인 할일을 찾지 못했습니다. /todo 를 다시 실행하세요."
-    job_name = _telegram_todo_cache_job_name(user_id=user_id, chat_id=chat_id)
-    try:
-        db.update_sync_state(job_name, last_run_at=None, last_cursor_json={}, user_id=user_id)
-    except Exception:
-        logger.debug("failed to clear telegram todo cache", exc_info=True)
+    _clear_telegram_todo_cache(db, user_id=user_id, chat_id=chat_id)
     return "\n".join(["[KU] 개인 할일 완료", "", str(updated.get("title") or item.get("title") or "할일"), "", "확인: /todo"])
 
 
@@ -12084,6 +12169,7 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /todo : 개인 할일 + LMS 과제 통합 보기 (refresh로 새로고침)",
         "- /add <내용> : 개인 할일 추가 (예: /add 운영체제 복습 내일 22:00)",
         "- /task <번호> : /todo 항목 상세 보기",
+        "- /task <번호> <새 내용> : 개인 할일 수정",
         "- /done <번호> : 개인 할일 완료 처리",
         "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목만 보기",
         "- /assignment <번호> : /assignments 항목 상세 보기",
@@ -12823,6 +12909,18 @@ def _execute_telegram_command(
             "ok": True,
             "message": _format_telegram_todo_detail(
                 index=command_payload.get("index"),
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
+        }
+    if command == "todo_update":
+        return {
+            "ok": True,
+            "message": _format_telegram_update_personal_todo(
+                index=command_payload.get("index"),
+                text=command_payload.get("text"),
                 settings=settings,
                 db=db,
                 user_id=user_id,

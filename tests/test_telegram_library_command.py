@@ -116,6 +116,12 @@ def test_parse_todo_commands():
         "text": "경제학 복습 04/30 22:00",
     }
     assert telegram.parse_command_message("/task 2") == {"command": "todo_detail", "ok": True, "index": "2"}
+    assert telegram.parse_command_message("/task 2 경제학 복습 내일 22:00") == {
+        "command": "todo_update",
+        "ok": True,
+        "index": "2",
+        "text": "경제학 복습 내일 22:00",
+    }
     assert telegram.parse_command_message("/done 2") == {"command": "todo_done", "ok": True, "index": "2"}
 
 
@@ -449,7 +455,7 @@ def test_format_todo_combines_personal_tasks_and_lms_assignments(monkeypatch, tm
     assert "LMS 상세: /assignment 4" in detail
 
 
-def test_add_and_done_personal_todo_only_marks_personal_items(monkeypatch, tmp_path):
+def test_add_update_and_done_personal_todo_only_marks_personal_items(monkeypatch, tmp_path):
     from ku_secretary.db import Database
 
     db = Database(tmp_path / "ku.db")
@@ -479,6 +485,23 @@ def test_add_and_done_personal_todo_only_marks_personal_items(monkeypatch, tmp_p
         chat_id="123",
     )
     listing = pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
+    lms_update_reject = pipeline._format_telegram_update_personal_todo(
+        index="1",
+        text="LMS 과제 수정 시도",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    personal_update = pipeline._format_telegram_update_personal_todo(
+        index="2",
+        text="경제학 문제풀이 05/01 21:30",
+        settings=settings,
+        db=db,
+        user_id=7,
+        chat_id="123",
+    )
+    listing_after_update = pipeline._format_telegram_todo(settings=settings, db=db, user_id=7, chat_id="123")
     lms_reject = pipeline._format_telegram_done_personal_todo(
         index="1",
         settings=settings,
@@ -499,6 +522,11 @@ def test_add_and_done_personal_todo_only_marks_personal_items(monkeypatch, tmp_p
     assert "마감 04/30 22:00" in added
     assert "1. [경제원론II 05분반] LMS 과제" in listing
     assert "2. [개인] 경제학 복습" in listing
+    assert "LMS 과제는 직접 수정하지 않습니다" in lms_update_reject
+    assert "[KU] 개인 할일 수정" in personal_update
+    assert "경제학 문제풀이" in personal_update
+    assert "마감 05/01 21:30" in personal_update
+    assert "2. [개인] 경제학 문제풀이" in listing_after_update
     assert "LMS 과제는 수동 완료 처리하지 않습니다" in lms_reject
     assert "[KU] 개인 할일 완료" in personal_done
     assert not [task for task in tasks if task.source == "personal"]

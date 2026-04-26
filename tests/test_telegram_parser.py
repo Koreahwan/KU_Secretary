@@ -83,6 +83,12 @@ def test_parse_command_message_todo_commands() -> None:
         "text": "운영체제 복습 내일 22:00",
     }
     assert parse_command_message("/task 3") == {"command": "todo_detail", "ok": True, "index": "3"}
+    assert parse_command_message("/task 3 운영체제 복습 내일 22:00") == {
+        "command": "todo_update",
+        "ok": True,
+        "index": "3",
+        "text": "운영체제 복습 내일 22:00",
+    }
     assert parse_command_message("/done 3") == {"command": "todo_done", "ok": True, "index": "3"}
 
 

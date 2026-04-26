@@ -81,6 +81,9 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
     if command in {"/task", "/todo_detail", "/할일상세"}:
         if len(parts) < 2:
             return {"command": "todo_detail", "ok": False, "error": "expected '/task <number>'"}
+        update_text = body.split(maxsplit=2)[2].strip() if len(parts) >= 3 else ""
+        if update_text:
+            return {"command": "todo_update", "ok": True, "index": parts[1].strip(), "text": update_text}
         return {"command": "todo_detail", "ok": True, "index": parts[1].strip()}
     if command in {"/week", "/weekly", "/이번주"}:
         return {"command": "assignment_week", "ok": True}
