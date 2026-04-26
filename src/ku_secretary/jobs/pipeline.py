@@ -161,6 +161,7 @@ TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE = 5
 TELEGRAM_LMS_MESSAGE_SOFT_LIMIT = 3600
 TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS = 180
 TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX = "telegram_assignments_cache"
+TELEGRAM_ASSIGNMENT_WEEK_LOOKAHEAD_DAYS = 7
 PORTAL_SECURE_STORAGE_MISSING_REASON = "KU portal session missing from secure storage; reconnect required"
 UCLASS_SECURE_STORAGE_MISSING_REASON = "UClass token missing from secure storage; reconnect required"
 UCLASS_RECONNECT_REQUIRED_REASON = "UClass token expired or unavailable; reconnect required"
@@ -8320,7 +8321,7 @@ def _inbox_item_type_label(item_type: str) -> str:
 def _format_telegram_access_denied(chat_id: str | None) -> str:
     lines = ["[KU] 접근 제한", ""]
     lines.append("- 이 채팅은 아직 사용할 수 있도록 활성화되지 않았습니다.")
-    lines.append("- `/setup`으로 연결 상태를 확인하세요.")
+    lines.append("- 관리자에게 Telegram 채팅 허용 상태를 확인하세요.")
     return "\n".join(lines)
 
 
@@ -9325,13 +9326,13 @@ def _telegram_assignments_cache_job_name(
     return f"{TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX}:{digest}"
 
 
-def _get_cached_telegram_assignments(
+def _get_cached_telegram_assignments_payload(
     db: Database | None,
     *,
     job_name: str,
     user_id: int | None,
     now: datetime,
-) -> str | None:
+) -> dict[str, Any] | None:
     if db is None:
         return None
     try:
@@ -9346,7 +9347,23 @@ def _get_cached_telegram_assignments(
     age = (now.astimezone(timezone.utc) - generated_at.astimezone(timezone.utc)).total_seconds()
     if age < 0 or age > TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS:
         return None
-    return message
+    return payload
+
+
+def _get_cached_telegram_assignments(
+    db: Database | None,
+    *,
+    job_name: str,
+    user_id: int | None,
+    now: datetime,
+) -> str | None:
+    payload = _get_cached_telegram_assignments_payload(
+        db,
+        job_name=job_name,
+        user_id=user_id,
+        now=now,
+    )
+    return str(payload.get("message") or "").strip() if payload else None
 
 
 def _store_cached_telegram_assignments(
@@ -9356,6 +9373,7 @@ def _store_cached_telegram_assignments(
     user_id: int | None,
     message: str,
     generated_at: datetime,
+    items: list[dict[str, Any]] | None = None,
 ) -> None:
     if db is None or not str(message or "").strip():
         return
@@ -9367,6 +9385,7 @@ def _store_cached_telegram_assignments(
                 "generated_at": generated_at.astimezone(timezone.utc).replace(microsecond=0).isoformat(),
                 "ttl_seconds": TELEGRAM_ASSIGNMENTS_CACHE_TTL_SECONDS,
                 "message": message,
+                "items": items or [],
             },
             user_id=user_id,
         )
@@ -9380,6 +9399,7 @@ def _format_telegram_assignments(
     db: Database | None = None,
     user_id: int | None = None,
     chat_id: str | int | None = None,
+    force_refresh: bool = False,
 ) -> str:
     """Render Canvas LMS todo + upcoming events for /assignments replies.
 
@@ -9402,14 +9422,15 @@ def _format_telegram_assignments(
         chat_id=chat_id,
     )
     cache_now = datetime.now(timezone.utc)
-    cached_message = _get_cached_telegram_assignments(
-        db,
-        job_name=cache_job_name,
-        user_id=user_id,
-        now=cache_now,
-    )
-    if cached_message is not None:
-        return cached_message
+    if not force_refresh:
+        cached_message = _get_cached_telegram_assignments(
+            db,
+            job_name=cache_job_name,
+            user_id=user_id,
+            now=cache_now,
+        )
+        if cached_message is not None:
+            return cached_message
 
     try:
         session = ku_lms.login(user_id=login_id, password=password)
@@ -9748,12 +9769,38 @@ def _format_telegram_assignments(
             user_id=user_id,
             message=message,
             generated_at=cache_now,
+            items=[],
         )
         return message
 
     lines = ["[KU] 내야 할 과제"]
     known_course_order = list(course_ids)
     course_groups: dict[int | str, dict[str, Any]] = {}
+    cache_items: list[dict[str, Any]] = []
+
+    def append_assignment_display_item(
+        *,
+        title: Any,
+        details: list[str],
+        course_name: Any,
+        due_at: Any = "",
+        source_label: str = "",
+        evidence: str = "",
+        item_type: str = "assignment",
+    ) -> None:
+        index = len(cache_items) + 1
+        _append_lms_list_item(lines, title=f"{index}. {title}", details=details)
+        cache_items.append(
+            {
+                "index": index,
+                "title": str(title or "").strip(),
+                "course_name": _compact_lms_course_name(course_name),
+                "due_at": str(due_at or "").strip(),
+                "source_label": str(source_label or "").strip(),
+                "evidence": str(evidence or "").strip(),
+                "type": str(item_type or "assignment").strip(),
+            }
+        )
 
     def course_group_key(course_id: int | None, fallback_name: str = "기타") -> int | str:
         if course_id is not None:
@@ -9823,14 +9870,28 @@ def _format_telegram_assignments(
             details = []
             if row.get("due_at"):
                 details.append(f"마감 {_format_lms_list_dt(row['due_at'], timezone_name=timezone_name)}")
-            _append_lms_list_item(lines, title=row["title"], details=details)
+            append_assignment_display_item(
+                title=row["title"],
+                details=details,
+                course_name=group["name"],
+                due_at=row.get("due_at"),
+                source_label="Canvas 할 일",
+                item_type="todo",
+            )
         for row in group["course_assignments"]:
             if rendered_course_items >= TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT:
                 continue
             details = []
             if row.get("due_at"):
                 details.append(f"마감 {_format_lms_list_dt(row['due_at'], timezone_name=timezone_name)}")
-            _append_lms_list_item(lines, title=row["title"], details=details)
+            append_assignment_display_item(
+                title=row["title"],
+                details=details,
+                course_name=group["name"],
+                due_at=row.get("due_at"),
+                source_label="과제",
+                item_type="course_assignment",
+            )
             rendered_course_items += 1
         if group["source_hints"]:
             lines.append("공지/자료/게시판 제출 항목")
@@ -9840,7 +9901,15 @@ def _format_telegram_assignments(
             details = [str(hint.source_label or "").strip()]
             if hint.due_at:
                 details.append(f"마감 {_format_lms_list_dt(hint.due_at, timezone_name=timezone_name)}")
-            _append_lms_list_item(lines, title=hint.title, details=details)
+            append_assignment_display_item(
+                title=hint.title,
+                details=details,
+                course_name=group["name"],
+                due_at=hint.due_at,
+                source_label=hint.source_label,
+                evidence=hint.evidence,
+                item_type="source_hint",
+            )
             rendered_source_hints += 1
         if group["events"]:
             lines.append("이벤트")
@@ -9878,6 +9947,7 @@ def _format_telegram_assignments(
         user_id=user_id,
         message=message,
         generated_at=cache_now,
+        items=cache_items,
     )
     return message
 
@@ -9898,6 +9968,153 @@ def _format_lms_list_dt(value: str | None, *, timezone_name: str = "Asia/Seoul")
     if match:
         return f"{match.group('month')}/{match.group('day')} {match.group('hm')}"
     return text[:16] if len(text) > 16 else text
+
+
+def _telegram_assignments_cached_payload_for_user(
+    *,
+    settings: Settings | None,
+    db: Database | None,
+    user_id: int | None,
+    chat_id: str | int | None,
+    allow_refresh: bool = True,
+) -> dict[str, Any] | None:
+    credentials = _resolve_telegram_lms_credentials(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    if credentials is None:
+        return None
+    login_id, _password = credentials
+    job_name = _telegram_assignments_cache_job_name(
+        login_id=login_id,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    now = datetime.now(timezone.utc)
+    payload = _get_cached_telegram_assignments_payload(
+        db,
+        job_name=job_name,
+        user_id=user_id,
+        now=now,
+    )
+    if payload is not None or not allow_refresh:
+        return payload
+    _format_telegram_assignments(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+        force_refresh=True,
+    )
+    return _get_cached_telegram_assignments_payload(
+        db,
+        job_name=job_name,
+        user_id=user_id,
+        now=datetime.now(timezone.utc),
+    )
+
+
+def _format_telegram_assignment_detail(
+    *,
+    index: Any,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    try:
+        target_index = int(str(index or "").strip())
+    except (TypeError, ValueError):
+        return "사용법: /assignment <번호>"
+    payload = _telegram_assignments_cached_payload_for_user(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return "상세를 볼 과제 캐시가 없습니다. 먼저 /assignments 를 실행하세요."
+    item = next(
+        (row for row in items if isinstance(row, dict) and int(row.get("index") or 0) == target_index),
+        None,
+    )
+    if item is None:
+        return f"{target_index}번 과제를 찾지 못했습니다. /assignments 에 표시된 번호를 사용하세요."
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    lines = [f"[KU] 과제 상세 #{target_index}", ""]
+    lines.append(str(item.get("title") or "(제목 없음)").strip())
+    details = []
+    course_name = str(item.get("course_name") or "").strip()
+    if course_name:
+        details.append(course_name)
+    source_label = str(item.get("source_label") or "").strip()
+    if source_label:
+        details.append(source_label)
+    due_at = str(item.get("due_at") or "").strip()
+    if due_at:
+        details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+    if details:
+        lines.append(" | ".join(details))
+    evidence = _truncate_lms_text(item.get("evidence") or "", 700)
+    if evidence:
+        lines.extend(["", "근거", evidence])
+    return "\n".join(lines)
+
+
+def _format_telegram_assignment_week(
+    *,
+    settings: Settings | None = None,
+    db: Database | None = None,
+    user_id: int | None = None,
+    chat_id: str | int | None = None,
+) -> str:
+    payload = _telegram_assignments_cached_payload_for_user(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        return "이번 주 마감 과제가 없습니다. 먼저 /assignments 로 최신 목록을 확인할 수 있습니다."
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    now_local = datetime.now(ZoneInfo(timezone_name))
+    until_local = (now_local + timedelta(days=TELEGRAM_ASSIGNMENT_WEEK_LOOKAHEAD_DAYS)).replace(
+        hour=23,
+        minute=59,
+        second=59,
+        microsecond=999999,
+    )
+    rows: list[tuple[datetime, dict[str, Any]]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        due_dt = _parse_dt(str(item.get("due_at") or ""))
+        if due_dt is None:
+            continue
+        due_local = due_dt.astimezone(ZoneInfo(timezone_name))
+        if now_local <= due_local <= until_local:
+            rows.append((due_local, item))
+    rows.sort(key=lambda pair: (pair[0], str(pair[1].get("course_name") or ""), str(pair[1].get("title") or "")))
+    lines = ["[KU] 이번 주 마감", ""]
+    if not rows:
+        lines.append("- 이번 주 마감 과제가 없습니다.")
+        return "\n".join(lines)
+    for due_local, item in rows[:12]:
+        title = f"{item.get('index')}. {item.get('title') or '(제목 없음)'}"
+        details = [
+            str(item.get("course_name") or "").strip(),
+            str(item.get("source_label") or "").strip(),
+            f"마감 {due_local.strftime('%m/%d %H:%M')}",
+        ]
+        _append_lms_list_item(lines, title=title, details=details)
+    remaining = len(rows) - 12
+    if remaining > 0:
+        lines.append(f"- 외 {remaining}건")
+    return "\n".join(lines)
 
 
 def _truncate_lms_text(value: Any, limit: int = 64) -> str:
@@ -11258,6 +11475,8 @@ def _telegram_bot_menu_commands(settings: Settings) -> list[dict[str, str]]:
         {"command": "notice_academic", "description": "학교 학사공지 10개 보기"},
         {"command": "library", "description": "도서관 좌석 현황 보기"},
         {"command": "assignments", "description": "내야 할 과제 목록 보기"},
+        {"command": "assignment", "description": "과제 상세 보기"},
+        {"command": "week", "description": "이번 주 마감 보기"},
         {"command": "submitted", "description": "제출 완료 과제 보기"},
         {"command": "board", "description": "과목별 게시판/공지 모음 보기"},
         {"command": "materials", "description": "과목별 강의자료 위치 보기"},
@@ -11378,7 +11597,9 @@ def _format_telegram_help(settings: Settings) -> str:
         "- /notice_general : 학교 일반공지",
         "- /notice_academic : 학교 학사공지",
         "- /library [도서관명] : 도서관 좌석 현황 (예: /library 중앙도서관)",
-        "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목 (별칭: /due /todo /과제)",
+        "- /assignments : 제출해야 할 LMS 과제와 공지/자료/게시판 제출 항목 (refresh로 새로고침)",
+        "- /assignment <번호> : /assignments 항목 상세 보기",
+        "- /week : 이번 주 마감 과제",
         "- /submitted : 제출 완료 LMS 과제 (별칭: /submissions /제출완료)",
         "- /board : 과목별 LMS 공지/게시판 최근 글 (별칭: /announcements /공지)",
         "- /materials : 과목별 LMS 모듈/게시판 강의자료 위치 (별칭: /자료 /강의자료)",
@@ -12121,6 +12342,28 @@ def _execute_telegram_command(
         return {
             "ok": True,
             "message": _format_telegram_assignments(
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+                force_refresh=bool(command_payload.get("refresh")),
+            ),
+        }
+    if command == "assignment_detail":
+        return {
+            "ok": True,
+            "message": _format_telegram_assignment_detail(
+                index=command_payload.get("index"),
+                settings=settings,
+                db=db,
+                user_id=user_id,
+                chat_id=chat_id,
+            ),
+        }
+    if command == "assignment_week":
+        return {
+            "ok": True,
+            "message": _format_telegram_assignment_week(
                 settings=settings,
                 db=db,
                 user_id=user_id,

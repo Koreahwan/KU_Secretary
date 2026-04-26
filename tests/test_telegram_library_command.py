@@ -107,6 +107,20 @@ def test_parse_assignments_aliases():
         assert telegram.parse_command_message(cmd) == expected, cmd
 
 
+def test_parse_assignment_refresh_detail_and_week():
+    assert telegram.parse_command_message("/assignments refresh") == {
+        "command": "assignments",
+        "ok": True,
+        "refresh": True,
+    }
+    assert telegram.parse_command_message("/assignment 2") == {
+        "command": "assignment_detail",
+        "ok": True,
+        "index": "2",
+    }
+    assert telegram.parse_command_message("/week") == {"command": "assignment_week", "ok": True}
+
+
 def test_parse_submitted_assignments_aliases():
     expected = {"command": "submitted_assignments", "ok": True}
     for cmd in ("/submitted", "/submissions", "/done_assignments", "/제출완료", "/낸과제"):
@@ -328,6 +342,47 @@ def test_format_assignments_uses_short_cache(monkeypatch, tmp_path):
     assert calls["login"] == 1
 
 
+def test_format_assignment_detail_and_week_use_assignments_cache(monkeypatch, tmp_path):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+    from ku_secretary.db import Database
+
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
+    monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 11, "name": "사이버기술과법"}])
+    monkeypatch.setattr(ku_lms, "get_assignments", lambda s, course_id, *, upcoming_only=False: [])
+    monkeypatch.setattr(
+        ku_lms,
+        "get_announcements",
+        lambda s, course_ids: [
+            {
+                "context_code": "course_11",
+                "title": "보고서 제출 안내",
+                "message": "보고서 과제는 2026-05-01 23:59까지 제출하세요.",
+            }
+        ],
+    )
+    monkeypatch.setattr(ku_lms, "get_modules", lambda s, course_id, *, include_items=True: [])
+    monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [])
+
+    listing = pipeline._format_telegram_assignments(db=db, user_id=7, chat_id="123")
+    assert "- 1. 보고서 안내" in listing
+
+    monkeypatch.setattr(ku_lms, "login", lambda **kwargs: pytest.fail("detail should use cache"))
+    detail = pipeline._format_telegram_assignment_detail(index="1", db=db, user_id=7, chat_id="123")
+    week = pipeline._format_telegram_assignment_week(db=db, user_id=7, chat_id="123")
+
+    assert "[KU] 과제 상세 #1" in detail
+    assert "보고서 안내" in detail
+    assert "근거" in detail
+    assert "[KU] 이번 주 마감" in week
+    assert "- 1. 보고서 안내" in week
+
+
 def test_parse_board_aliases():
     expected = {"command": "lms_board", "ok": True}
     for cmd in ("/board", "/lms_board", "/lmsboard", "/announcements", "/공지"):
@@ -359,7 +414,7 @@ def test_format_assignments_scans_each_course(monkeypatch):
 
     out = pipeline._format_telegram_assignments()
     assert "[사이버기술과법]" in out
-    assert "- 개별 강의 과제" in out
+    assert "- 1. 개별 강의 과제" in out
     assert "  마감 04/30 23:00" in out
 
 
@@ -460,7 +515,7 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
     assert "중간고사 과제 우수자 발표 안내" not in out
     assert "[사이버기술과법]" in out
     assert "  공지 | 마감 05/01 23:59" in out
-    assert "- HW#1 공지" in out
+    assert "HW#1 공지" in out
     assert "  공지 | 마감 05/03 19:00" in out
     assert "  모듈/자료 | 마감 05/02 18:00" in out
     assert "  게시판 자료실 | 마감 05/03 12:00" in out

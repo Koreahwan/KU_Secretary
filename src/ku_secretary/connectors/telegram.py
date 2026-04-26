@@ -66,7 +66,17 @@ def parse_command_message(text: str) -> dict[str, Any] | None:
             payload["library"] = query
         return payload
     if command in {"/assignments", "/due", "/homework", "/todo", "/to_submit", "/과제", "/제출할거", "/해야할거"}:
-        return {"command": "assignments", "ok": True}
+        query = body[len(parts[0]) :].strip().lower()
+        payload = {"command": "assignments", "ok": True}
+        if query in {"refresh", "새로고침", "reload"}:
+            payload["refresh"] = True
+        return payload
+    if command in {"/assignment", "/과제상세"}:
+        if len(parts) < 2:
+            return {"command": "assignment_detail", "ok": False, "error": "expected '/assignment <number>'"}
+        return {"command": "assignment_detail", "ok": True, "index": parts[1].strip()}
+    if command in {"/week", "/weekly", "/이번주"}:
+        return {"command": "assignment_week", "ok": True}
     if command in {"/submitted", "/submissions", "/done_assignments", "/제출완료", "/낸과제"}:
         return {"command": "submitted_assignments", "ok": True}
     if command in {"/board", "/lms_board", "/lmsboard", "/announcements", "/공지"}:
