@@ -9392,9 +9392,6 @@ def _format_telegram_assignments(
                     "body",
                     "description",
                     "content",
-                    "posted_at",
-                    "created_at",
-                    "delayed_post_at",
                 ),
             ),
         ]
@@ -9487,7 +9484,7 @@ def _format_telegram_assignments(
                     title,
                     *_lms_text_lines_from_dict(
                         post,
-                        ("title", "subject", "message", "body", "content", "created_at", "posted_at"),
+                        ("title", "subject", "message", "body", "content"),
                     ),
                 ]
                 post_id = _lms_post_id(post)
@@ -9511,8 +9508,6 @@ def _format_telegram_assignments(
                                     "description",
                                     "attachments",
                                     "files",
-                                    "created_at",
-                                    "posted_at",
                                 ),
                             )
                         )
@@ -9547,19 +9542,19 @@ def _format_telegram_assignments(
             a = t.get("assignment") or {}
             name = (a.get("name") or t.get("title") or "(제목 없음)").strip()
             due_at = _pretty_dt(a.get("due_at"))
-            row = f"- {name}"
+            details = []
             if due_at:
-                row += f" | 마감 {due_at}"
-            lines.append(row)
+                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=name, details=details)
 
     if course_assignment_rows:
         lines.append("")
         lines.append(f"과목별 과제 확인 ({len(course_assignment_rows)}건, {scanned_courses}개 과목 스캔)")
         for course_name, name, due_at in course_assignment_rows[:TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT]:
-            row = f"- {course_name} | {name}"
+            details = [_compact_lms_course_name(course_name)]
             if due_at:
-                row += f" | 마감 {due_at}"
-            lines.append(row)
+                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=name, details=details)
         remaining = len(course_assignment_rows) - TELEGRAM_LMS_ASSIGNMENT_DISPLAY_LIMIT
         if remaining > 0:
             lines.append(f"- 외 {remaining}건")
@@ -9569,10 +9564,10 @@ def _format_telegram_assignments(
         lines.append(f"공지/자료/게시판에서 감지 ({len(source_hint_rows)}건)")
         for hint in source_hint_rows[:TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT]:
             due_at = _pretty_dt(hint.due_at)
-            row = f"- {hint.course_name} | {hint.source_label} | {hint.title}"
+            details = [_compact_lms_course_name(hint.course_name), str(hint.source_label or "").strip()]
             if due_at:
-                row += f" | 마감 {due_at}"
-            lines.append(row)
+                details.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=hint.title, details=details)
         remaining = len(source_hint_rows) - TELEGRAM_LMS_ASSIGNMENT_HINT_DISPLAY_LIMIT
         if remaining > 0:
             lines.append(f"- 외 {remaining}건")
@@ -9583,10 +9578,10 @@ def _format_telegram_assignments(
         for ev in events[:8]:
             title = (ev.get("title") or "(제목 없음)").strip()
             start = _pretty_dt(ev.get("start_at"))
-            row = f"- {title}"
+            details = []
             if start:
-                row += f" | {start}"
-            lines.append(row)
+                details.append(f"일정 {_format_lms_list_dt(start, timezone_name=timezone_name)}")
+            _append_lms_list_item(lines, title=title, details=details)
 
     if scanned_courses:
         lines.append("")
@@ -9600,6 +9595,70 @@ def _format_telegram_assignments(
         )
 
     return "\n".join(lines)
+
+
+def _format_lms_list_dt(value: str | None, *, timezone_name: str = "Asia/Seoul") -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    parsed = _parse_dt(text)
+    if parsed is not None:
+        try:
+            local = parsed.astimezone(ZoneInfo(timezone_name))
+        except Exception:
+            local = parsed
+        return local.strftime("%m/%d %H:%M")
+    text = text.replace("T", " ").replace("Z", "")
+    match = re.match(r"(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})\s+(?P<hm>\d{2}:\d{2})", text)
+    if match:
+        return f"{match.group('month')}/{match.group('day')} {match.group('hm')}"
+    return text[:16] if len(text) > 16 else text
+
+
+def _truncate_lms_text(value: Any, limit: int = 64) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if len(text) <= max(int(limit), 1):
+        return text
+    return text[: max(int(limit), 1) - 1].rstrip() + "…"
+
+
+def _compact_lms_course_name(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not text:
+        return "강의"
+    text = re.sub(r"^\s*[A-Za-z0-9][A-Za-z0-9_-]*\s+", "", text)
+    text = re.sub(r"^\s*\([^)]*\)\s*", "", text)
+
+    def strip_ascii_parenthetical(match: re.Match[str]) -> str:
+        inner = match.group(1)
+        return "" if re.search(r"[A-Za-z]", inner) else match.group(0)
+
+    text = re.sub(r"\(([^)]*)\)", strip_ascii_parenthetical, text)
+    text = re.sub(r"[-_\s]*(\d{2})\s*분반\s*$", r" \1분반", text)
+    text = re.sub(r"\s+", " ", text).strip(" -_/")
+    return _truncate_lms_text(text or str(value or "").strip() or "강의", 36)
+
+
+def _lms_submission_status_label(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    return {
+        "submitted": "제출됨",
+        "graded": "채점됨",
+        "pending_review": "검토중",
+    }.get(raw, raw or "상태 확인")
+
+
+def _append_lms_list_item(
+    lines: list[str],
+    *,
+    title: Any,
+    details: list[str],
+    title_limit: int = 62,
+) -> None:
+    lines.append(f"- {_truncate_lms_text(title, title_limit)}")
+    compact_details = [str(item or "").strip() for item in details if str(item or "").strip()]
+    if compact_details:
+        lines.append(f"  {' | '.join(compact_details)}")
 
 
 def _format_telegram_submitted_assignments(
@@ -9633,6 +9692,7 @@ def _format_telegram_submitted_assignments(
         return f"강의 목록 조회 실패: {exc}"
     if not courses:
         return "[KU] 제출 완료 과제\n- 등록된 강의가 없습니다."
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
 
     def _pretty_dt(value: str | None) -> str:
         if not value:
@@ -9699,18 +9759,17 @@ def _format_telegram_submitted_assignments(
     lines.append("")
     lines.append(f"제출 완료 ({len(rows)}건)")
     for row in rows[:TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT]:
-        pieces = [
-            f"- {row['course_name']} | {row['title']}",
-        ]
+        lines.append(f"- {_truncate_lms_text(row['title'], 62)}")
+        pieces = [_compact_lms_course_name(row["course_name"])]
         submitted_at = _pretty_dt(str(row.get("submitted_at") or ""))
         if submitted_at:
-            pieces.append(f"제출 {submitted_at}")
+            pieces.append(f"제출 {_format_lms_list_dt(submitted_at, timezone_name=timezone_name)}")
         workflow_state = str(row.get("workflow_state") or "").strip()
         if workflow_state:
-            pieces.append(f"상태 {workflow_state}")
+            pieces.append(_lms_submission_status_label(workflow_state))
         due_at = _pretty_dt(str(row.get("due_at") or ""))
         if due_at:
-            pieces.append(f"마감 {due_at}")
+            pieces.append(f"마감 {_format_lms_list_dt(due_at, timezone_name=timezone_name)}")
         grade = str(row.get("grade") or "").strip()
         score = row.get("score")
         if grade:
@@ -9719,7 +9778,7 @@ def _format_telegram_submitted_assignments(
             pieces.append(f"점수 {score}")
         if bool(row.get("late")):
             pieces.append("지각 제출")
-        lines.append(" | ".join(pieces))
+        lines.append(f"  {' | '.join(item for item in pieces if item)}")
     remaining = len(rows) - TELEGRAM_LMS_SUBMITTED_DISPLAY_LIMIT
     if remaining > 0:
         lines.append(f"- 외 {remaining}건")
@@ -9932,6 +9991,7 @@ def _format_telegram_lms_board(
         course_name[cid] = nm
 
     course_ids = course_ids[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
 
     try:
         announcements = ku_lms.get_announcements(session, course_ids) or []
@@ -9940,37 +10000,15 @@ def _format_telegram_lms_board(
 
     bucket: dict[int, list[tuple[str, str, str]]] = {cid: [] for cid in course_ids}
 
-    def _pretty_dt(value: Any) -> str:
-        s = str(value or "").strip()
-        if not s:
-            return ""
-        s = s.replace("T", " ")
-        return s[:16]
-
-    def _course_id_of(item: dict) -> int | None:
-        for key in ("course_id", "courseId"):
-            v = item.get(key)
-            if v is None:
-                continue
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                pass
-        ctx = str(item.get("context_code") or "")
-        if ctx.startswith("course_"):
-            try:
-                return int(ctx.split("_", 1)[1])
-            except ValueError:
-                return None
-        return None
-
     for ann in announcements:
-        cid = _course_id_of(ann)
+        cid = _lms_course_id_of_item(ann)
         if cid is None or cid not in bucket:
             continue
         title = (ann.get("title") or ann.get("subject") or "").strip() or "(제목 없음)"
-        when = _pretty_dt(
+        when = _format_lms_list_dt(
             ann.get("posted_at") or ann.get("created_at") or ann.get("delayed_post_at")
+            or "",
+            timezone_name=timezone_name,
         )
         bucket[cid].append(("공지", when, title))
 
@@ -9992,8 +10030,9 @@ def _format_telegram_lms_board(
             posts = _lms_board_posts_from_response(resp)
             for p in posts[:TELEGRAM_LMS_BOARD_POST_LIMIT_PER_BOARD]:
                 title = (p.get("title") or p.get("subject") or "").strip() or "(제목 없음)"
-                when = _pretty_dt(
-                    p.get("posted_at") or p.get("created_at") or p.get("date")
+                when = _format_lms_list_dt(
+                    p.get("posted_at") or p.get("created_at") or p.get("date") or "",
+                    timezone_name=timezone_name,
                 )
                 board_name = (b.get("name") or b.get("title") or "보드").strip()
                 bucket[cid].append((board_name, when, title))
@@ -10006,12 +10045,17 @@ def _format_telegram_lms_board(
             continue
         rendered_any = True
         lines.append("")
-        lines.append(f"[{course_name.get(cid, cid)}]")
+        lines.append(f"[{_compact_lms_course_name(course_name.get(cid, cid))}]")
         for kind, when, title in items[:6]:
-            prefix = f"- {kind}"
-            if when:
-                prefix += f" {when}"
-            if not _append_limited_telegram_line(lines, f"{prefix} | {title}"):
+            before_len = len(lines)
+            _append_lms_list_item(
+                lines,
+                title=title,
+                details=[str(kind or "").strip(), str(when or "").strip()],
+            )
+            candidate = "\n".join(lines)
+            if len(candidate) > TELEGRAM_LMS_MESSAGE_SOFT_LIMIT:
+                del lines[before_len:]
                 lines.append("- 외 항목은 길이 제한 때문에 생략했습니다.")
                 return "\n".join(lines)
 
@@ -10071,6 +10115,7 @@ def _format_telegram_lms_materials(
             continue
         scanned_courses += 1
         course_lines: list[str] = []
+        course_item_count = 0
         seen_titles: set[str] = set()
 
         try:
@@ -10096,13 +10141,14 @@ def _format_telegram_lms_materials(
                 if key in seen_titles:
                     continue
                 seen_titles.add(key)
-                prefix = f"- 모듈 {item_type}"
+                prefix = f"모듈 {item_type}"
                 if module_name:
                     prefix += f" ({module_name})"
-                course_lines.append(f"{prefix}: {title}")
-                if len(course_lines) >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
+                course_lines.extend([f"- {_truncate_lms_text(title, 62)}", f"  {prefix}"])
+                course_item_count += 1
+                if course_item_count >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
                     break
-            if len(course_lines) >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
+            if course_item_count >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
                 break
 
         try:
@@ -10131,17 +10177,18 @@ def _format_telegram_lms_materials(
                 if key in seen_titles:
                     continue
                 seen_titles.add(key)
-                course_lines.append(f"- 게시판 {board_name}: {title}")
+                course_lines.extend([f"- {_truncate_lms_text(title, 62)}", f"  게시판 {board_name}"])
+                course_item_count += 1
                 board_material_lines += 1
-                if board_material_lines >= 3:
+                if board_material_lines >= 3 or course_item_count >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
                     break
-            if board_material_lines >= 3:
+            if board_material_lines >= 3 or course_item_count >= TELEGRAM_LMS_MATERIAL_DISPLAY_LIMIT_PER_COURSE:
                 break
 
         if not course_lines:
             continue
         rendered_any = True
-        if not _append_limited_telegram_line(lines, f"[{course_name}]"):
+        if not _append_limited_telegram_line(lines, f"[{_compact_lms_course_name(course_name)}]"):
             break
         for row in course_lines:
             if not _append_limited_telegram_line(lines, row):

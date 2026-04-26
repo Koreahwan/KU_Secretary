@@ -144,7 +144,7 @@ def test_format_assignments_renders_todo_and_events(monkeypatch):
     out = pipeline._format_telegram_assignments()
     assert "[KU] 내야 할 과제" in out
     assert "중간고사 대체 과제" in out
-    assert "2026-04-26 14:59" in out
+    assert "04/26 23:59" in out
     assert "과제 (1건)" in out
     assert "다가오는 이벤트 (1건)" in out
 
@@ -325,7 +325,8 @@ def test_format_assignments_scans_each_course(monkeypatch):
 
     out = pipeline._format_telegram_assignments()
     assert "과목별 과제 확인" in out
-    assert "사이버기술과법 | 개별 강의 과제" in out
+    assert "- 개별 강의 과제" in out
+    assert "  사이버기술과법 | 마감 04/30 23:00" in out
 
 
 def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch):
@@ -379,9 +380,9 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
 
     out = pipeline._format_telegram_assignments()
     assert "공지/자료/게시판에서 감지" in out
-    assert "사이버기술과법 | 공지" in out
-    assert "사이버기술과법 | 모듈/자료" in out
-    assert "사이버기술과법 | 게시판 자료실" in out
+    assert "  사이버기술과법 | 공지 | 마감 05/01 23:59" in out
+    assert "  사이버기술과법 | 모듈/자료 | 마감 05/02 18:00" in out
+    assert "  사이버기술과법 | 게시판 자료실 | 마감 05/03 12:00" in out
     assert "확인: 1개 과목의 과제/공지/자료/게시판을 직접 확인했습니다." in out
 
 
@@ -415,9 +416,47 @@ def test_format_submitted_assignments_renders_submission_status(monkeypatch):
 
     out = pipeline._format_telegram_submitted_assignments()
     assert "[KU] 제출 완료 과제" in out
-    assert "사이버기술과법 | 완료한 과제" in out
-    assert "제출 2026-04-25 12:30" in out
+    assert "- 완료한 과제" in out
+    assert "  사이버기술과법 | 제출 04/25 21:30 | 제출됨 | 마감 04/26 23:59" in out
     assert "아직 안 낸 과제" not in out
+
+
+def test_format_submitted_assignments_compacts_long_course_names(monkeypatch):
+    monkeypatch.setenv("KU_PORTAL_ID", "uid")
+    monkeypatch.setenv("KU_PORTAL_PW", "pw")
+    from ku_secretary.connectors import ku_lms
+
+    monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
+    monkeypatch.setattr(
+        ku_lms,
+        "get_courses",
+        lambda s: [
+            {
+                "id": 11,
+                "name": "261R (서울-학부)사이버기술과법(CYBER TECHNOLOGY AND LAW)-00분반",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        ku_lms,
+        "get_submissions",
+        lambda s, course_id: [
+            {
+                "submitted_at": "2026-04-25T12:30:00Z",
+                "workflow_state": "graded",
+                "grade": "24",
+                "assignment": {
+                    "name": "긴 과제명",
+                    "due_at": "2026-04-26T14:59:00Z",
+                },
+            }
+        ],
+    )
+
+    out = pipeline._format_telegram_submitted_assignments()
+    assert "261R" not in out
+    assert "CYBER TECHNOLOGY" not in out
+    assert "  사이버기술과법 00분반 | 제출 04/25 21:30 | 채점됨 | 마감 04/26 23:59 | 성적 24" in out
 
 
 def test_format_lms_board_renders_per_course(monkeypatch):
@@ -466,9 +505,11 @@ def test_format_lms_board_renders_per_course(monkeypatch):
     out = pipeline._format_telegram_lms_board()
     assert "[KU] 과목별 게시판/공지" in out
     assert "[사이버기술과법]" in out
-    assert "공지 2026-04-25 09:00 | 중간고사 공지" in out
+    assert "- 중간고사 공지" in out
+    assert "  공지 | 04/25 18:00" in out
     assert "[빅데이터응용보안]" in out
-    assert "Q&A 2026-04-26 01:00 | 프로젝트 관련 질문" in out
+    assert "- 프로젝트 관련 질문" in out
+    assert "  Q&A | 04/26 10:00" in out
 
 
 def test_format_lms_board_reads_items_payload_and_more_boards(monkeypatch):
@@ -497,7 +538,8 @@ def test_format_lms_board_reads_items_payload_and_more_boards(monkeypatch):
 
     monkeypatch.setattr(ku_lms, "list_board_posts", fake_posts)
     out = pipeline._format_telegram_lms_board()
-    assert "강의자료실 2026-04-26 02:00 | 네번째 보드 자료" in out
+    assert "- 네번째 보드 자료" in out
+    assert "  강의자료실 | 04/26 11:00" in out
     assert "과목당 최대" in out
 
 
@@ -527,8 +569,10 @@ def test_format_lms_materials_scans_modules_and_boards(monkeypatch):
     out = pipeline._format_telegram_lms_materials()
     assert "[KU] 강의자료 위치" in out
     assert "[운영체제]" in out
-    assert "모듈 File (9주차): 스케줄링.pdf" in out
-    assert "게시판 공지: 보강 자료 업로드" in out
+    assert "- 스케줄링.pdf" in out
+    assert "  모듈 File (9주차)" in out
+    assert "- 보강 자료 업로드" in out
+    assert "  게시판 공지" in out
 
 
 def test_format_lms_board_empty(monkeypatch):
