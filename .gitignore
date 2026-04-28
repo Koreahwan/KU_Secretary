@@ -21,6 +21,7 @@ __pypackages__/
 
 data/
 credentials/
+google_calendar_token.json
 secret_store/
 secret-store/
 browser_profile/

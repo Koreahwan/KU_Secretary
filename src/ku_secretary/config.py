@@ -252,6 +252,12 @@ class Settings:
     air_quality_enabled: bool
     air_quality_seoul_api_key: str | None
     air_quality_district_codes: list[str]
+    google_calendar_sync_enabled: bool
+    google_calendar_id: str
+    google_calendar_token_file: Path | None
+    google_calendar_credentials_file: Path | None
+    google_calendar_task_duration_min: int
+    google_calendar_sync_window_days: int
     ops_dashboard_ssh_host: str | None
     ops_dashboard_ssh_user: str | None
     ops_dashboard_ssh_port: int
@@ -393,6 +399,24 @@ class Settings:
             "AIR_QUALITY_ENABLED": str(self.air_quality_enabled),
             "AIR_QUALITY_SEOUL_API_KEY": "***" if self.air_quality_seoul_api_key else "",
             "AIR_QUALITY_DISTRICT_CODES": ",".join(self.air_quality_district_codes),
+            "GOOGLE_CALENDAR_SYNC_ENABLED": str(self.google_calendar_sync_enabled),
+            "GOOGLE_CALENDAR_ID": self.google_calendar_id,
+            "GOOGLE_CALENDAR_TOKEN_FILE": (
+                str(self.google_calendar_token_file)
+                if self.google_calendar_token_file
+                else ""
+            ),
+            "GOOGLE_CALENDAR_CREDENTIALS_FILE": (
+                str(self.google_calendar_credentials_file)
+                if self.google_calendar_credentials_file
+                else ""
+            ),
+            "GOOGLE_CALENDAR_TASK_DURATION_MIN": str(
+                self.google_calendar_task_duration_min
+            ),
+            "GOOGLE_CALENDAR_SYNC_WINDOW_DAYS": str(
+                self.google_calendar_sync_window_days
+            ),
             "OPS_DASHBOARD_SSH_HOST": self.ops_dashboard_ssh_host or "",
             "OPS_DASHBOARD_SSH_USER": self.ops_dashboard_ssh_user or "",
             "OPS_DASHBOARD_SSH_PORT": str(self.ops_dashboard_ssh_port),
@@ -426,6 +450,11 @@ def load_settings(config_file: Path | None = None) -> Settings:
         str(storage_root_dir / "browser_profiles")
         if storage_root_dir is not None
         else "data/onboarding_browser_profiles"
+    )
+    google_calendar_token_default = (
+        str(storage_root_dir / "google_calendar_token.json")
+        if storage_root_dir is not None
+        else "data/google_calendar_token.json"
     )
 
     settings = Settings(
@@ -641,6 +670,28 @@ def load_settings(config_file: Path | None = None) -> Settings:
         or None,
         air_quality_district_codes=_to_csv_list(
             merged.get("AIR_QUALITY_DISTRICT_CODES") or "111152,111171"
+        ),
+        google_calendar_sync_enabled=_to_bool(
+            merged.get("GOOGLE_CALENDAR_SYNC_ENABLED"), default=False
+        ),
+        google_calendar_id=str(
+            merged.get("GOOGLE_CALENDAR_ID") or "primary"
+        ).strip()
+        or "primary",
+        google_calendar_token_file=_resolve_optional_path_from_config_dir(
+            merged.get("GOOGLE_CALENDAR_TOKEN_FILE")
+            or google_calendar_token_default,
+            config_dir=config_dir,
+        ),
+        google_calendar_credentials_file=_resolve_optional_path_from_config_dir(
+            merged.get("GOOGLE_CALENDAR_CREDENTIALS_FILE"),
+            config_dir=config_dir,
+        ),
+        google_calendar_task_duration_min=_to_int(
+            merged.get("GOOGLE_CALENDAR_TASK_DURATION_MIN"), default=60
+        ),
+        google_calendar_sync_window_days=_to_int(
+            merged.get("GOOGLE_CALENDAR_SYNC_WINDOW_DAYS"), default=120
         ),
         ops_dashboard_ssh_host=(
             str(merged.get("OPS_DASHBOARD_SSH_HOST") or "").strip() or None

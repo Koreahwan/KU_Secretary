@@ -97,6 +97,14 @@ DIGEST_TIME_LOCAL = "08:30"
 DIGEST_CHANNEL = "telegram"
 DIGEST_TASK_LOOKAHEAD_DAYS = 3
 
+# Optional Google Calendar sync for UClass/academic deadlines and exam-like events
+GOOGLE_CALENDAR_SYNC_ENABLED = false
+GOOGLE_CALENDAR_ID = "primary"
+GOOGLE_CALENDAR_TOKEN_FILE = "data/google_calendar_token.json"
+GOOGLE_CALENDAR_CREDENTIALS_FILE = "credentials/google_oauth_client.json"
+GOOGLE_CALENDAR_TASK_DURATION_MIN = 60
+GOOGLE_CALENDAR_SYNC_WINDOW_DAYS = 120
+
 # Optional morning/evening briefing push
 BRIEFING_ENABLED = false
 BRIEFING_MORNING_TIME_LOCAL = "09:00"

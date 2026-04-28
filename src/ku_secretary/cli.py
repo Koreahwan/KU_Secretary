@@ -64,6 +64,7 @@ from ku_secretary.jobs.pipeline import (
     refresh_beta_user,
     run_all_jobs,
     send_scheduled_briefings as send_scheduled_briefings_job,
+    sync_google_calendar as sync_google_calendar_job,
     sync_weather as sync_weather_job,
     sync_uclass as sync_uclass_job,
     sync_telegram as sync_telegram_job,
@@ -678,6 +679,9 @@ def _sync_telegram_lock_path(db_path: Path) -> Path:
 def _sync_uclass_lock_path(db_path: Path) -> Path:
     return _sync_job_lock_path(db_path, "sync-uclass")
 
+def _sync_google_calendar_lock_path(db_path: Path) -> Path:
+    return _sync_job_lock_path(db_path, "sync-google-calendar")
+
 def _sync_weather_lock_path(db_path: Path) -> Path:
     return _sync_job_lock_path(db_path, "sync-weather")
 
@@ -795,9 +799,38 @@ def _run_sync_uclass_once(
                 stats[name] = fn(settings, db)
             except Exception as exc:
                 errors.append(f"{name}: {exc}")
+        if bool(getattr(settings, "google_calendar_sync_enabled", False)):
+            try:
+                stats["sync_google_calendar"] = sync_google_calendar_job(settings, db)
+            except Exception as exc:
+                errors.append(f"sync_google_calendar: {exc}")
     return {
         "ok": not errors,
         "stats": stats,
+        "errors": errors,
+        "lock_path": str(lock_path),
+    }
+
+
+def _run_sync_google_calendar_once(
+    settings: Any,
+    db: Database,
+    *,
+    wait: bool = False,
+    timeout_seconds: float | None = None,
+) -> dict[str, Any]:
+    lock_path = _sync_google_calendar_lock_path(settings.database_path)
+    with _sync_all_execution_lock(
+        lock_path=lock_path,
+        wait=wait,
+        timeout_seconds=timeout_seconds,
+    ):
+        result = sync_google_calendar_job(settings, db)
+    error = str(result.get("error") or "").strip() if isinstance(result, dict) else ""
+    errors = [error] if error else []
+    return {
+        "ok": not errors,
+        "stats": result,
         "errors": errors,
         "lock_path": str(lock_path),
     }
@@ -854,6 +887,7 @@ def _run_sync_weather_once(
 def _sync_all_shared_job_lock_path(job_name: str, db_path: Path) -> Path | None:
     lock_builders: dict[str, Callable[[Path], Path]] = {
         "sync_uclass": _sync_uclass_lock_path,
+        "sync_google_calendar": _sync_google_calendar_lock_path,
         "sync_weather": _sync_weather_lock_path,
         "sync_telegram": _sync_telegram_lock_path,
         "scheduled_briefings": _send_briefings_lock_path,
@@ -869,7 +903,7 @@ def _sync_all_job_should_wait(job_name: str, wait: bool) -> bool:
         return False
     # telegram-listener holds this lock for its full lifetime, so sync --all should skip instead
     # of blocking behind a long-poll daemon.
-    return job_name in {"sync_uclass", "sync_weather"}
+    return job_name in {"sync_uclass", "sync_google_calendar", "sync_weather"}
 
 
 def _run_sync_all_job_with_shared_lock(
@@ -1983,6 +2017,58 @@ def sync_uclass_command(
             "ok": False,
             "error": "sync_uclass_lock_timeout",
             "message": "Timed out while waiting for UClass sync lock.",
+            "lock_path": exc.lock_path,
+            "waited_seconds": round(exc.waited_seconds, 3),
+        }
+        typer.echo(json.dumps(payload, indent=2))
+        raise typer.Exit(code=4)
+    typer.echo(json.dumps(report, indent=2))
+    if not report["ok"]:
+        raise typer.Exit(code=1)
+
+@app.command("sync-google-calendar")
+def sync_google_calendar_command(
+    wait: bool = typer.Option(
+        False,
+        "--wait",
+        help="Wait for sync lock if another Google Calendar sync is already running.",
+    ),
+    timeout_seconds: Optional[float] = typer.Option(
+        None,
+        "--timeout-seconds",
+        "--timeout",
+        min=0.01,
+        help="With --wait, stop waiting after this many seconds.",
+    ),
+    config_file: Optional[Path] = typer.Option(None, help="Path to config TOML."),
+) -> None:
+    """Upsert academic deadlines and exam-like events into Google Calendar."""
+    configure_logging()
+    if timeout_seconds is not None and not wait:
+        typer.echo("--timeout-seconds requires --wait.")
+        raise typer.Exit(code=2)
+    settings, db = _load_settings_and_init_db(config_file=config_file)
+    try:
+        report = _run_sync_google_calendar_once(
+            settings=settings,
+            db=db,
+            wait=wait,
+            timeout_seconds=timeout_seconds,
+        )
+    except _SyncLockBusyError:
+        payload = {
+            "ok": False,
+            "error": "sync_google_calendar_lock_held",
+            "message": "Another `kus sync-google-calendar` process is running.",
+            "lock_path": str(_sync_google_calendar_lock_path(settings.database_path)),
+        }
+        typer.echo(json.dumps(payload, indent=2))
+        raise typer.Exit(code=4)
+    except _SyncLockTimeoutError as exc:
+        payload = {
+            "ok": False,
+            "error": "sync_google_calendar_lock_timeout",
+            "message": "Timed out while waiting for Google Calendar sync lock.",
             "lock_path": exc.lock_path,
             "waited_seconds": round(exc.waited_seconds, 3),
         }

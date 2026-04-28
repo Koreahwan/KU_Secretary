@@ -1080,6 +1080,39 @@ MIGRATIONS: list[tuple[int, str]] = [
             ON assistant_runs(status, created_at DESC);
         """,
     ),
+    (
+        23,
+        """
+        CREATE TABLE IF NOT EXISTS lms_source_cache (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL DEFAULT 0,
+            course_id INTEGER NOT NULL,
+            course_name TEXT NOT NULL,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            source_url TEXT,
+            title TEXT NOT NULL,
+            body_text TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}',
+            payload_hash TEXT NOT NULL,
+            extraction_version TEXT NOT NULL,
+            parsed_task_ids_json TEXT NOT NULL DEFAULT '[]',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            fetched_at TEXT NOT NULL,
+            expires_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(user_id, course_id, source_kind, source_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_lms_source_cache_user_course
+            ON lms_source_cache(user_id, course_id, source_kind, updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_lms_source_cache_expiry
+            ON lms_source_cache(expires_at);
+        CREATE INDEX IF NOT EXISTS idx_lms_source_cache_payload_hash
+            ON lms_source_cache(user_id, course_id, payload_hash);
+        """,
+    ),
 ]
 
 
@@ -3046,6 +3079,188 @@ class Database:
             metadata_json=metadata,
             user_id=owner_id,
         )
+
+    def get_lms_source_cache(
+        self,
+        *,
+        user_id: int | None,
+        course_id: int,
+        source_kind: str,
+        source_id: str,
+    ) -> dict[str, Any] | None:
+        owner_id = _normalize_user_id(user_id, default=0) or 0
+        kind = str(source_kind or "").strip()
+        sid = str(source_id or "").strip()
+        if not kind or not sid:
+            return None
+        with self.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    user_id, course_id, course_name, source_kind, source_id,
+                    source_url, title, body_text, payload_json, payload_hash,
+                    extraction_version, parsed_task_ids_json, metadata_json,
+                    fetched_at, expires_at, created_at, updated_at
+                FROM lms_source_cache
+                WHERE user_id = ?
+                  AND course_id = ?
+                  AND source_kind = ?
+                  AND source_id = ?
+                LIMIT 1
+                """,
+                (owner_id, int(course_id), kind, sid),
+            ).fetchone()
+        if not row:
+            return None
+        return {
+            "user_id": int(row["user_id"]),
+            "course_id": int(row["course_id"]),
+            "course_name": str(row["course_name"] or ""),
+            "source_kind": str(row["source_kind"] or ""),
+            "source_id": str(row["source_id"] or ""),
+            "source_url": str(row["source_url"] or "").strip() or None,
+            "title": str(row["title"] or ""),
+            "body_text": str(row["body_text"] or ""),
+            "payload_json": _json_load(row["payload_json"]),
+            "payload_hash": str(row["payload_hash"] or ""),
+            "extraction_version": str(row["extraction_version"] or ""),
+            "parsed_task_ids": _json_load_list(row["parsed_task_ids_json"]),
+            "metadata_json": _json_load(row["metadata_json"]),
+            "fetched_at": row["fetched_at"],
+            "expires_at": row["expires_at"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def upsert_lms_source_cache(
+        self,
+        *,
+        user_id: int | None,
+        course_id: int,
+        course_name: str,
+        source_kind: str,
+        source_id: str,
+        title: str,
+        body_text: str | None = None,
+        payload_json: dict[str, Any] | None = None,
+        source_url: str | None = None,
+        extraction_version: str = "unknown",
+        parsed_task_ids: list[str] | None = None,
+        metadata_json: dict[str, Any] | None = None,
+        expires_at: str | datetime | None = None,
+    ) -> dict[str, Any]:
+        owner_id = _normalize_user_id(user_id, default=0) or 0
+        kind = str(source_kind or "").strip()
+        sid = str(source_id or "").strip()
+        if not kind:
+            raise ValueError("source_kind is required")
+        if not sid:
+            raise ValueError("source_id is required")
+        payload = payload_json or {}
+        payload_blob = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+        payload_hash = sha256(payload_blob.encode("utf-8")).hexdigest()
+        ts = now_utc_iso()
+        expires_norm = normalize_datetime(expires_at)
+        with self.connection() as conn:
+            existing = conn.execute(
+                """
+                SELECT payload_hash, created_at
+                FROM lms_source_cache
+                WHERE user_id = ?
+                  AND course_id = ?
+                  AND source_kind = ?
+                  AND source_id = ?
+                LIMIT 1
+                """,
+                (owner_id, int(course_id), kind, sid),
+            ).fetchone()
+            changed = existing is None or str(existing["payload_hash"] or "") != payload_hash
+            conn.execute(
+                """
+                INSERT INTO lms_source_cache(
+                    user_id, course_id, course_name, source_kind, source_id,
+                    source_url, title, body_text, payload_json, payload_hash,
+                    extraction_version, parsed_task_ids_json, metadata_json,
+                    fetched_at, expires_at, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, course_id, source_kind, source_id)
+                DO UPDATE SET
+                    course_name = excluded.course_name,
+                    source_url = excluded.source_url,
+                    title = excluded.title,
+                    body_text = excluded.body_text,
+                    payload_json = excluded.payload_json,
+                    payload_hash = excluded.payload_hash,
+                    extraction_version = excluded.extraction_version,
+                    parsed_task_ids_json = excluded.parsed_task_ids_json,
+                    metadata_json = excluded.metadata_json,
+                    fetched_at = excluded.fetched_at,
+                    expires_at = excluded.expires_at,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    owner_id,
+                    int(course_id),
+                    str(course_name or "").strip(),
+                    kind,
+                    sid,
+                    str(source_url or "").strip() or None,
+                    str(title or "").strip(),
+                    str(body_text or ""),
+                    payload_blob,
+                    payload_hash,
+                    str(extraction_version or "").strip() or "unknown",
+                    _json_dump_list(parsed_task_ids),
+                    _json_dump(metadata_json),
+                    ts,
+                    expires_norm,
+                    ts,
+                    ts,
+                ),
+            )
+        cached = self.get_lms_source_cache(
+            user_id=owner_id,
+            course_id=course_id,
+            source_kind=kind,
+            source_id=sid,
+        )
+        if cached is None:
+            raise RuntimeError("failed to persist LMS source cache")
+        cached["changed"] = changed
+        return cached
+
+    def update_lms_source_cache_parsed_tasks(
+        self,
+        *,
+        user_id: int | None,
+        course_id: int,
+        source_kind: str,
+        source_id: str,
+        parsed_task_ids: list[str],
+    ) -> None:
+        owner_id = _normalize_user_id(user_id, default=0) or 0
+        ts = now_utc_iso()
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE lms_source_cache
+                SET parsed_task_ids_json = ?,
+                    updated_at = ?
+                WHERE user_id = ?
+                  AND course_id = ?
+                  AND source_kind = ?
+                  AND source_id = ?
+                """,
+                (
+                    _json_dump_list(parsed_task_ids),
+                    ts,
+                    owner_id,
+                    int(course_id),
+                    str(source_kind or "").strip(),
+                    str(source_id or "").strip(),
+                ),
+            )
 
     def record_artifact(
         self,

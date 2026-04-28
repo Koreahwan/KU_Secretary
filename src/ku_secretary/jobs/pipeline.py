@@ -59,6 +59,10 @@ from ku_secretary.connectors.ku_openapi import (
     ku_openapi_timetable_configured,
     ku_openapi_uses_official_catalog_mode,
 )
+from ku_secretary.connectors.google_calendar import (
+    GoogleCalendarClient,
+    google_calendar_event_id,
+)
 from ku_secretary.connectors.ku_library import (
     get_library_seats,
     list_known_libraries,
@@ -105,7 +109,7 @@ from ku_secretary.db import (
     normalize_course_alias,
     now_utc_iso,
 )
-from ku_secretary.models import Task
+from ku_secretary.models import Event, Task
 from ku_secretary.onboarding import (
     MOODLE_ONBOARDING_SESSION_KIND,
     build_public_moodle_connect_url,
@@ -164,6 +168,8 @@ TELEGRAM_TODO_CACHE_TTL_SECONDS = 6 * 60 * 60
 TELEGRAM_ASSIGNMENTS_CACHE_JOB_PREFIX = "telegram_assignments_cache"
 TELEGRAM_TODO_CACHE_JOB_PREFIX = "telegram_todo_cache"
 TELEGRAM_ASSIGNMENT_WEEK_LOOKAHEAD_DAYS = 7
+LMS_SOURCE_CACHE_EXTRACTION_VERSION = "lms-calendar-v1"
+LMS_SOURCE_CACHE_DETAIL_TTL_SECONDS = 20 * 60
 PORTAL_SECURE_STORAGE_MISSING_REASON = "KU portal session missing from secure storage; reconnect required"
 UCLASS_SECURE_STORAGE_MISSING_REASON = "UClass token missing from secure storage; reconnect required"
 UCLASS_RECONNECT_REQUIRED_REASON = "UClass token expired or unavailable; reconnect required"
@@ -6121,6 +6127,1464 @@ def sync_uclass(settings: Settings, db: Database) -> dict[str, Any]:
         "targets": target_results,
         "failed_targets": failures,
     }
+
+
+GOOGLE_CALENDAR_ACADEMIC_EVENT_RE = re.compile(
+    r"(시험|중간|기말|퀴즈|발표|과제|레포트|리포트|제출|"
+    r"\bexam\b|\bmidterm\b|\bfinal\b|\bquiz\b|\btest\b|"
+    r"\bpresentation\b|\bpresent\b|\bhw\b|\bhomework\b|\bassignment\b|\breport\b|\bproject\b)",
+    re.IGNORECASE,
+)
+
+
+def _google_calendar_enabled(settings: Settings) -> bool:
+    return bool(getattr(settings, "google_calendar_sync_enabled", False))
+
+
+def _google_calendar_config_error(settings: Settings) -> str | None:
+    token_file = getattr(settings, "google_calendar_token_file", None)
+    if not token_file:
+        return "GOOGLE_CALENDAR_TOKEN_FILE is required"
+    if not Path(token_file).exists():
+        return f"Google Calendar token file not found: {token_file}"
+    return None
+
+
+def _calendar_item_metadata(value: str | dict[str, Any] | None) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return dict(value)
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _calendar_evidence_link(metadata: dict[str, Any]) -> str | None:
+    for key in ("url", "original_url", "article_url"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raw = metadata.get("raw")
+    if isinstance(raw, dict):
+        for key in ("url", "html_url", "viewurl"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _calendar_course_label(metadata: dict[str, Any]) -> str | None:
+    for key in ("course_name", "canonical_course_id"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    raw = metadata.get("raw")
+    if isinstance(raw, dict):
+        for key in ("coursefullname", "coursename", "course"):
+            value = raw.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def _calendar_description(
+    *,
+    kind: str,
+    title: str,
+    metadata: dict[str, Any],
+    when_label: str | None = None,
+    status_label: str | None = None,
+) -> str:
+    _ = kind, metadata, when_label
+    lines: list[str] = []
+    if status_label:
+        lines.append(f"상태: {status_label}")
+    if title.strip():
+        lines.append(f"내용: {title.strip()}")
+    return "\n".join(lines)
+
+
+def _calendar_category(
+    title: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+    default: str,
+) -> str:
+    text = str(title or "")
+    meta = metadata or {}
+    item_type = str(meta.get("item_type") or meta.get("type") or "").strip().lower()
+    if item_type == "quiz":
+        return "퀴즈"
+    if re.search(r"(발표|\bpresentation\b|\bpresent\b)", text, re.I):
+        return "발표"
+    if re.search(
+        r"(과제|레포트|리포트|제출|\bhw\b|\bhomework\b|\bassignment\b|\breport\b|\bproject\b)",
+        text,
+        re.I,
+    ):
+        return "과제"
+    if item_type in {"assignment", "course_assignment"}:
+        return "과제"
+    if re.search(r"(퀴즈|\bquiz\b)", text, re.I):
+        return "퀴즈"
+    if re.search(r"(시험|중간|기말|\bexam\b|\bmidterm\b|\bfinal\b|\btest\b)", text, re.I):
+        return "시험"
+    return default
+
+
+def _calendar_dt(value: str | None, timezone_name: str) -> datetime | None:
+    parsed = _parse_dt(value)
+    if not parsed:
+        return None
+    try:
+        tz = ZoneInfo(str(timezone_name or "Asia/Seoul"))
+    except Exception:
+        tz = timezone.utc
+    return parsed.astimezone(tz).replace(microsecond=0)
+
+
+def _calendar_course_title_label(value: str) -> str:
+    raw = re.sub(r"\s+", " ", str(value or "").strip())
+    fallback = re.sub(r"[-_\s]*\d+\s*분반\s*$", "", raw).strip(" -_/")
+    compact = _compact_lms_course_name(value)
+    text = re.sub(r"[-_\s]*\d+\s*분반\s*$", "", compact)
+    text = re.sub(r"\s+", " ", text).strip(" -_/")
+    return text or fallback or compact
+
+
+def _calendar_title_subject(title: str, metadata: dict[str, Any], category: str) -> str:
+    course = _calendar_course_label(metadata)
+    if course:
+        try:
+            return _calendar_course_title_label(course)
+        except Exception:
+            return course
+    subject = re.sub(r"\([^)]*\)", " ", str(title or ""))
+    subject = re.sub(r"\[[^]]*\]", " ", subject)
+    subject = re.sub(
+        r"(시험|중간|기말|퀴즈|발표|과제|레포트|리포트|제출|"
+        r"\bexam\b|\bmidterm\b|\bfinal\b|\bquiz\b|\btest\b|"
+        r"\bpresentation\b|\bpresent\b|\bhw\b|\bhomework\b|\bassignment\b|\breport\b|\bproject\b)",
+        " ",
+        subject,
+        flags=re.IGNORECASE,
+    )
+    subject = re.sub(r"\s+", " ", subject).strip(" :-_/")
+    return subject or str(title or "").strip() or "일정"
+
+
+def _calendar_time_suffix(value: datetime) -> str:
+    if value.hour == 23 and value.minute == 59:
+        return ""
+    return value.strftime(" %H:%M")
+
+
+def _calendar_summary(
+    title: str,
+    metadata: dict[str, Any],
+    category: str,
+    *,
+    when: datetime | None = None,
+) -> str:
+    subject = _calendar_title_subject(title, metadata, category)
+    time_suffix = _calendar_time_suffix(when) if when is not None else ""
+    return f"{subject} {category}{time_suffix}".strip()
+
+
+def _calendar_all_day_bounds(value: datetime) -> tuple[str, str]:
+    start_date = value.date()
+    end_date = start_date + timedelta(days=1)
+    return start_date.isoformat(), end_date.isoformat()
+
+
+def _strikethrough_text(value: str) -> str:
+    text = str(value or "").strip()
+    return f"{text} [완료]".strip()
+
+
+def _task_completed_for_calendar_display(task: Task, due_at: datetime) -> bool:
+    status = str(task.status or "").strip().lower()
+    if status in {"done", "completed", "complete", "closed"}:
+        return True
+    now = datetime.now(due_at.tzinfo or timezone.utc)
+    return due_at < now
+
+
+def _task_google_calendar_payload(
+    task: Task,
+    *,
+    timezone_name: str,
+    duration_min: int,
+) -> tuple[str, dict[str, Any]] | None:
+    due_at = _calendar_dt(task.due_at, timezone_name)
+    if not due_at:
+        return None
+    _ = duration_min
+    start_date, end_date = _calendar_all_day_bounds(due_at)
+    metadata = _calendar_item_metadata(task.metadata_json)
+    category = _calendar_category(task.title, metadata=metadata, default="과제")
+    completed = _task_completed_for_calendar_display(task, due_at)
+    summary = _calendar_summary(task.title, metadata, category, when=due_at)
+    if completed:
+        summary = _strikethrough_text(summary)
+    event_id = google_calendar_event_id(
+        user_id=task.user_id,
+        source=task.source,
+        external_id=task.external_id,
+    )
+    payload = {
+        "summary": summary,
+        "description": _calendar_description(
+            kind=category,
+            title=task.title,
+            metadata=metadata,
+            when_label=f"마감: {due_at.isoformat()}",
+            status_label="완료" if completed else None,
+        ),
+        "start": {"date": start_date},
+        "end": {"date": end_date},
+        "reminders": {"useDefault": False, "overrides": []},
+        "extendedProperties": {
+            "private": {
+                "ku_secretary_kind": "task",
+                "ku_secretary_external_id": task.external_id,
+                "ku_secretary_source": task.source,
+                "ku_secretary_user_id": str(int(task.user_id or 0)),
+            }
+        },
+    }
+    link = _calendar_evidence_link(metadata)
+    if link:
+        payload["source"] = {"title": "KU Secretary source", "url": link}
+    return event_id, payload
+
+
+def _event_google_calendar_payload(
+    event: Event,
+    *,
+    timezone_name: str,
+) -> tuple[str, dict[str, Any]] | None:
+    start_at = _calendar_dt(event.start_at, timezone_name)
+    end_at = _calendar_dt(event.end_at, timezone_name)
+    if not start_at or not end_at:
+        return None
+    start_date, end_date = _calendar_all_day_bounds(start_at)
+    metadata = _calendar_item_metadata(event.metadata_json)
+    category = _calendar_category(event.title, metadata=metadata, default="일정")
+    event_id = google_calendar_event_id(
+        user_id=event.user_id,
+        source=event.source,
+        external_id=event.external_id,
+    )
+    payload = {
+        "summary": _calendar_summary(event.title, metadata, category, when=start_at),
+        "description": _calendar_description(
+            kind=category,
+            title=event.title,
+            metadata=metadata,
+            when_label=f"시작: {start_at.isoformat()}",
+        ),
+        "start": {"date": start_date},
+        "end": {"date": end_date},
+        "location": event.location or "",
+        "reminders": {"useDefault": False, "overrides": []},
+        "extendedProperties": {
+            "private": {
+                "ku_secretary_kind": "event",
+                "ku_secretary_external_id": event.external_id,
+                "ku_secretary_source": event.source,
+                "ku_secretary_user_id": str(int(event.user_id or 0)),
+            }
+        },
+    }
+    link = _calendar_evidence_link(metadata)
+    if link:
+        payload["source"] = {"title": "KU Secretary source", "url": link}
+    return event_id, payload
+
+
+def _task_should_sync_to_google_calendar(task: Task) -> bool:
+    if not task.due_at:
+        return False
+    if str(task.source or "").strip().lower() == "review":
+        return False
+    if str(task.status or "").strip().lower() == "ignored":
+        return False
+    return True
+
+
+def _task_google_calendar_dedupe_key(task: Task, *, timezone_name: str) -> tuple[str, str, str]:
+    metadata = _calendar_item_metadata(task.metadata_json)
+    due_at = _calendar_dt(task.due_at, timezone_name)
+    due_key = due_at.isoformat() if due_at is not None else str(task.due_at or "")
+    category = _calendar_category(task.title, metadata=metadata, default="과제")
+    course = _calendar_course_label(metadata)
+    subject = course or _calendar_title_subject(task.title, metadata, category)
+    return (
+        _normalize_task_title_key(str(subject or "")),
+        _normalize_task_title_key(str(task.title or "")),
+        due_key,
+    )
+
+
+def _event_should_sync_to_google_calendar(event: Event) -> bool:
+    source = str(event.source or "").strip().lower()
+    if source == "review" or event.external_id.startswith("review:"):
+        return False
+    return bool(GOOGLE_CALENDAR_ACADEMIC_EVENT_RE.search(str(event.title or "")))
+
+
+def _google_calendar_sync_user_ids(db: Database) -> list[int]:
+    try:
+        user_ids: list[int] = []
+        for row in db.list_users(status="active", limit=500):
+            user_id = _safe_int(row.get("user_id") or row.get("id"))
+            if user_id is not None and user_id > 0 and user_id not in user_ids:
+                user_ids.append(user_id)
+        if user_ids:
+            return user_ids
+    except Exception:
+        return [0]
+    return [0]
+
+
+def _google_calendar_candidate_tasks(db: Database, *, user_id: int) -> list[Task]:
+    with db.connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id, external_id, source, due_at, title, status, metadata_json
+            FROM tasks
+            WHERE user_id = ?
+              AND due_at IS NOT NULL
+            ORDER BY due_at ASC
+            """,
+            (int(user_id),),
+        ).fetchall()
+    return [
+        Task(
+            external_id=row["external_id"],
+            source=row["source"],
+            due_at=row["due_at"],
+            title=row["title"],
+            status=row["status"],
+            metadata_json=row["metadata_json"],
+            user_id=int(row["user_id"]),
+        )
+        for row in rows
+    ]
+
+
+def _lms_calendar_item_due_at(item: dict[str, Any]) -> str:
+    return str(
+        item.get("due_at")
+        or item.get("due_date")
+        or item.get("lock_at")
+        or item.get("unlock_at")
+        or ""
+    ).strip()
+
+
+def _lms_calendar_assignment_status(
+    *,
+    assignment: dict[str, Any],
+    submission: dict[str, Any] | None = None,
+) -> str:
+    sub = submission or {}
+    submitted_at = str(sub.get("submitted_at") or "").strip()
+    workflow_state = str(sub.get("workflow_state") or "").strip().lower()
+    if submitted_at or workflow_state in {"submitted", "graded", "pending_review"}:
+        return "done"
+    if bool(sub.get("missing")):
+        return "open"
+    if bool(assignment.get("has_submitted_submissions")):
+        return "done"
+    return "open"
+
+
+def _lms_calendar_assignment_metadata(
+    *,
+    course_id: int,
+    course_name: str,
+    assignment: dict[str, Any],
+    submission: dict[str, Any] | None = None,
+    item_type: str = "assignment",
+) -> dict[str, Any]:
+    sub = submission or {}
+    url = str(
+        assignment.get("html_url")
+        or assignment.get("url")
+        or sub.get("preview_url")
+        or ""
+    ).strip()
+    return {
+        "course_id": course_id,
+        "course_name": course_name,
+        "item_type": item_type,
+        "url": url,
+        "submitted_at": str(sub.get("submitted_at") or "").strip(),
+        "workflow_state": str(sub.get("workflow_state") or "").strip(),
+        "score": sub.get("score"),
+        "grade": sub.get("grade") or sub.get("entered_grade"),
+        "late": bool(sub.get("late")),
+        "raw_assignment_id": assignment.get("id") or assignment.get("assignment_id"),
+    }
+
+
+def _lms_calendar_source_hint_is_actionable(hint: _TelegramAssignmentHint) -> bool:
+    haystack = f"{hint.title} {hint.evidence}".lower()
+    if not _contains_submission_action_hints(hint.title, hint.evidence):
+        return False
+    return any(
+        signal in haystack
+        for signal in (
+            "제출",
+            "마감",
+            "기한",
+            "까지",
+            "submit",
+            "due",
+            "deadline",
+            "homework",
+            "hw",
+        )
+    )
+
+
+def _lms_calendar_correct_source_hint_due_at(
+    hint: _TelegramAssignmentHint,
+    *,
+    timezone_name: str,
+    reference_local: datetime,
+) -> _TelegramAssignmentHint:
+    due_dt = _parse_dt(str(hint.due_at or ""))
+    if due_dt is None:
+        return hint
+    local_tz = ZoneInfo(timezone_name)
+    due_local = due_dt.astimezone(local_tz)
+    if due_local.year >= reference_local.year:
+        return hint
+    corrected_dt = None
+    if hint.evidence:
+        corrected_text = re.sub(
+            rf"\b{due_local.year}\b",
+            str(reference_local.year),
+            hint.evidence,
+            count=1,
+        )
+        corrected_due = _coerce_due_iso(
+            corrected_text,
+            timezone_name=timezone_name,
+            reference_local=reference_local,
+            default_end_of_day=True,
+        )
+        corrected_dt = _parse_dt(corrected_due)
+    corrected = (
+        corrected_dt.astimezone(local_tz)
+        if corrected_dt is not None
+        else due_local.replace(year=reference_local.year)
+    )
+    if abs((corrected - reference_local).days) <= 240:
+        return _TelegramAssignmentHint(
+            course_name=hint.course_name,
+            source_label=hint.source_label,
+            title=hint.title,
+            due_at=corrected.isoformat(),
+            evidence=hint.evidence,
+        )
+    return hint
+
+
+def _lms_calendar_persist_source_hint(
+    db: Database,
+    *,
+    user_id: int,
+    course_id: int,
+    course_name: str,
+    hint: _TelegramAssignmentHint,
+    source_url: str = "",
+) -> str | None:
+    if not _lms_calendar_source_hint_is_actionable(hint):
+        return None
+    due_at = str(hint.due_at or "").strip()
+    title = str(hint.title or "").strip()
+    if not due_at or not title:
+        return None
+    seed = "|".join(
+        [
+            str(course_id),
+            str(hint.source_label or "").strip(),
+            _normalize_task_title_key(title),
+            due_at,
+        ]
+    )
+    external_id = f"ku_lms:source-hint:{course_id}:{sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+    metadata = {
+        "course_id": course_id,
+        "course_name": course_name,
+        "item_type": "assignment",
+        "source_label": str(hint.source_label or "").strip(),
+        "evidence": str(hint.evidence or "").strip(),
+        "url": str(source_url or "").strip(),
+    }
+    db.upsert_task(
+        external_id=external_id,
+        source="ku_lms",
+        due_at=due_at,
+        title=title,
+        status="open",
+        metadata_json=attach_provenance(
+            metadata,
+            source="uclass_ws",
+            confidence="medium",
+            derivation="canvas_lms_calendar_source_hint",
+        ),
+        user_id=user_id,
+    )
+    return external_id
+
+
+def _lms_calendar_user_match_terms(session: Any, login_id: str) -> set[str]:
+    terms: set[str] = set()
+    for value in (
+        login_id,
+        getattr(session, "user_id", None),
+        getattr(session, "user_name", None),
+    ):
+        text = str(value or "").strip()
+        if text:
+            terms.add(text)
+        name_match = re.match(r"([가-힣]{2,5})", text)
+        if name_match:
+            terms.add(name_match.group(1))
+    return {term for term in terms if term}
+
+
+def _lms_calendar_extract_notice_date(
+    *,
+    title: str,
+    text: str,
+    timezone_name: str,
+    reference_local: datetime,
+) -> str | None:
+    haystack = f"{title}\n{text}"
+    match = re.search(r"\((\d{1,2})[./-](\d{1,2})\)", str(title or ""))
+    if match:
+        month = int(match.group(1))
+        day = int(match.group(2))
+        try:
+            local_tz = ZoneInfo(timezone_name)
+            local_dt = datetime(
+                reference_local.year,
+                month,
+                day,
+                23,
+                59,
+                tzinfo=local_tz,
+            )
+            if local_dt < reference_local - timedelta(days=240):
+                local_dt = local_dt.replace(year=reference_local.year + 1)
+            return local_dt.astimezone(timezone.utc).replace(microsecond=0).isoformat()
+        except ValueError:
+            pass
+    return _coerce_due_iso(
+        haystack,
+        timezone_name=timezone_name,
+        reference_local=reference_local,
+        default_end_of_day=True,
+    )
+
+
+def _lms_calendar_presentation_hint_from_text(
+    *,
+    title: str,
+    course_name: str,
+    source_label: str,
+    text_lines: list[str],
+    timezone_name: str,
+    reference_local: datetime,
+    user_terms: set[str],
+) -> _TelegramAssignmentHint | None:
+    extracted_text = "\n".join(line for line in text_lines if str(line or "").strip())
+    haystack = f"{title}\n{extracted_text}"
+    if "발표" not in haystack or "대상자" not in haystack:
+        return None
+    if not any(term and term in haystack for term in user_terms):
+        return None
+    due_at = _lms_calendar_extract_notice_date(
+        title=title,
+        text=extracted_text,
+        timezone_name=timezone_name,
+        reference_local=reference_local,
+    )
+    if not due_at:
+        return None
+    clean_title = _clean_material_task_title(title) or str(title or "발표").strip()
+    return _TelegramAssignmentHint(
+        course_name=course_name,
+        source_label=source_label,
+        title=clean_title,
+        due_at=due_at,
+        evidence=haystack[:500],
+    )
+
+
+def _lms_calendar_persist_presentation_hint(
+    db: Database,
+    *,
+    user_id: int,
+    course_id: int,
+    course_name: str,
+    hint: _TelegramAssignmentHint,
+    source_url: str = "",
+) -> str | None:
+    due_at = str(hint.due_at or "").strip()
+    title = str(hint.title or "").strip()
+    if not due_at or not title:
+        return None
+    seed = "|".join(
+        [
+            str(course_id),
+            str(hint.source_label or "").strip(),
+            _normalize_task_title_key(title),
+            due_at,
+            "presentation",
+        ]
+    )
+    external_id = f"ku_lms:presentation:{course_id}:{sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+    metadata = {
+        "course_id": course_id,
+        "course_name": course_name,
+        "item_type": "presentation",
+        "source_label": str(hint.source_label or "").strip(),
+        "evidence": str(hint.evidence or "").strip(),
+        "url": str(source_url or "").strip(),
+    }
+    db.upsert_task(
+        external_id=external_id,
+        source="ku_lms",
+        due_at=due_at,
+        title=title,
+        status="open",
+        metadata_json=attach_provenance(
+            metadata,
+            source="uclass_ws",
+            confidence="high",
+            derivation="canvas_lms_calendar_presentation_target",
+        ),
+        user_id=user_id,
+    )
+    return external_id
+
+
+def _lms_source_cache_id(
+    *,
+    source_kind: str,
+    payload: dict[str, Any],
+    fallback_seed: str,
+) -> str:
+    for key in ("id", "post_id", "assignment_id", "url", "html_url"):
+        value = payload.get(key)
+        if value not in (None, ""):
+            return f"{source_kind}:{value}"
+    seed = f"{source_kind}|{fallback_seed}|{json.dumps(payload, ensure_ascii=True, sort_keys=True)}"
+    return f"{source_kind}:hash:{sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+
+
+def _lms_source_cache_expires_at() -> str:
+    return (
+        datetime.now(timezone.utc).replace(microsecond=0)
+        + timedelta(seconds=LMS_SOURCE_CACHE_DETAIL_TTL_SECONDS)
+    ).isoformat()
+
+
+def _lms_source_cache_is_fresh(cached: dict[str, Any] | None) -> bool:
+    if not cached:
+        return False
+    expires_at = _parse_dt(str(cached.get("expires_at") or ""))
+    if expires_at is None:
+        return False
+    return expires_at > datetime.now(timezone.utc)
+
+
+def _lms_cache_source_record(
+    db: Database,
+    *,
+    user_id: int,
+    course_id: int,
+    course_name: str,
+    source_kind: str,
+    source_id: str,
+    title: str,
+    body_text: str,
+    payload_json: dict[str, Any],
+    source_url: str = "",
+    parsed_task_ids: list[str] | None = None,
+    metadata_json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return db.upsert_lms_source_cache(
+        user_id=user_id,
+        course_id=course_id,
+        course_name=course_name,
+        source_kind=source_kind,
+        source_id=source_id,
+        title=title,
+        body_text=body_text,
+        payload_json=payload_json,
+        source_url=source_url,
+        extraction_version=LMS_SOURCE_CACHE_EXTRACTION_VERSION,
+        parsed_task_ids=parsed_task_ids,
+        metadata_json=metadata_json,
+        expires_at=_lms_source_cache_expires_at(),
+    )
+
+
+def _lms_calendar_persist_canvas_records(
+    settings: Settings,
+    db: Database,
+    *,
+    user_id: int,
+    chat_id: str | int | None = None,
+) -> dict[str, Any]:
+    from ku_secretary.connectors import ku_lms
+
+    credentials = _resolve_telegram_lms_credentials(
+        settings=settings,
+        db=db,
+        user_id=user_id,
+        chat_id=chat_id,
+    )
+    if credentials is None:
+        return {"skipped": True, "reason": "KU_PORTAL_ID/KU_PORTAL_PW missing"}
+    login_id, password = credentials
+    try:
+        session = ku_lms.login(user_id=login_id, password=password)
+        courses = ku_lms.get_courses(session) or []
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+    upserted = 0
+    scanned_courses = 0
+    failures: list[dict[str, Any]] = []
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    reference_local = datetime.now(ZoneInfo(timezone_name))
+    user_terms = _lms_calendar_user_match_terms(session, login_id)
+    source_cache_stats = {
+        "reads": 0,
+        "fresh_hits": 0,
+        "writes": 0,
+        "stale_fallbacks": 0,
+    }
+    for course in _lms_scannable_courses(courses)[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
+        if not isinstance(course, dict):
+            continue
+        cid, course_name = _lms_course_id_and_name(course)
+        if cid is None:
+            continue
+        scanned_courses += 1
+
+        assignment_ids_seen: set[str] = set()
+        assignment_title_due_seen: set[tuple[str, str]] = set()
+        source_hint_seen: set[tuple[str, str, str]] = set()
+        source_hint_pending: list[tuple[_TelegramAssignmentHint, str]] = []
+        presentation_seen: set[tuple[str, str]] = set()
+        standard_task_count = 0
+        submissions_by_assignment_id: dict[str, dict[str, Any]] = {}
+        try:
+            submissions = ku_lms.get_submissions(session, cid) or []
+        except Exception as exc:
+            submissions = []
+            failures.append({"course_id": cid, "stage": "submissions", "error": str(exc)})
+        for submission in submissions:
+            if not isinstance(submission, dict):
+                continue
+            assignment = submission.get("assignment") if isinstance(submission.get("assignment"), dict) else {}
+            raw_id = assignment.get("id") or submission.get("assignment_id")
+            if raw_id is not None:
+                submissions_by_assignment_id[str(raw_id)] = submission
+                assignment_ids_seen.add(str(raw_id))
+            if not assignment:
+                continue
+            due_at = _lms_calendar_item_due_at(assignment) or str(
+                submission.get("cached_due_date") or ""
+            ).strip()
+            if not due_at:
+                continue
+            title = str(
+                assignment.get("name")
+                or submission.get("assignment_name")
+                or submission.get("title")
+                or "LMS 과제"
+            ).strip()
+            assignment_title_due_seen.add((_normalize_task_title_key(title), due_at))
+            external_id = f"ku_lms:assignment:{cid}:{raw_id or sha1((course_name + title + due_at).encode('utf-8')).hexdigest()[:16]}"
+            db.upsert_task(
+                external_id=external_id,
+                source="ku_lms",
+                due_at=due_at,
+                title=title,
+                status=_lms_calendar_assignment_status(
+                    assignment=assignment,
+                    submission=submission,
+                ),
+                metadata_json=attach_provenance(
+                    _lms_calendar_assignment_metadata(
+                        course_id=cid,
+                        course_name=course_name,
+                        assignment=assignment,
+                        submission=submission,
+                        item_type="quiz" if bool(assignment.get("is_quiz_assignment")) else "assignment",
+                    ),
+                    source="uclass_ws",
+                    confidence="high",
+                    derivation="canvas_lms_calendar_submission",
+                ),
+                user_id=user_id,
+            )
+            upserted += 1
+            standard_task_count += 1
+
+        def persist_source_hints(
+            hints: list[_TelegramAssignmentHint],
+            *,
+            source_url: str = "",
+        ) -> list[str]:
+            parsed_task_ids: list[str] = []
+            for raw_hint in hints:
+                hint = _lms_calendar_correct_source_hint_due_at(
+                    raw_hint,
+                    timezone_name=timezone_name,
+                    reference_local=reference_local,
+                )
+                due_at = str(hint.due_at or "").strip()
+                title = str(hint.title or "").strip()
+                if not due_at or not title:
+                    continue
+                title_due_key = (_normalize_task_title_key(title), due_at)
+                if title_due_key in assignment_title_due_seen:
+                    continue
+                seen_key = (
+                    _normalize_task_title_key(str(hint.source_label or "")),
+                    title_due_key[0],
+                    due_at,
+                )
+                if seen_key in source_hint_seen:
+                    continue
+                source_hint_seen.add(seen_key)
+                source_hint_pending.append((hint, source_url))
+                seed = "|".join(
+                    [
+                        str(cid),
+                        str(hint.source_label or "").strip(),
+                        _normalize_task_title_key(title),
+                        due_at,
+                    ]
+                )
+                parsed_task_ids.append(
+                    f"ku_lms:source-hint:{cid}:{sha1(seed.encode('utf-8')).hexdigest()[:16]}"
+                )
+            return parsed_task_ids
+
+        def persist_presentation_hint(
+            hint: _TelegramAssignmentHint | None,
+            *,
+            source_url: str = "",
+        ) -> list[str]:
+            nonlocal upserted
+            if hint is None:
+                return []
+            due_at = str(hint.due_at or "").strip()
+            title = str(hint.title or "").strip()
+            if not due_at or not title:
+                return []
+            seen_key = (_normalize_task_title_key(title), due_at)
+            if seen_key in presentation_seen:
+                return []
+            presentation_seen.add(seen_key)
+            external_id = _lms_calendar_persist_presentation_hint(
+                db,
+                user_id=user_id,
+                course_id=cid,
+                course_name=course_name,
+                hint=hint,
+                source_url=source_url,
+            )
+            if external_id:
+                upserted += 1
+                return [external_id]
+            return []
+
+        try:
+            assignments = ku_lms.get_assignments(session, cid, upcoming_only=False) or []
+        except Exception as exc:
+            assignments = []
+            failures.append({"course_id": cid, "stage": "assignments", "error": str(exc)})
+        for assignment in assignments:
+            if not isinstance(assignment, dict):
+                continue
+            due_at = _lms_calendar_item_due_at(assignment)
+            if not due_at:
+                continue
+            raw_id = assignment.get("id") or assignment.get("assignment_id")
+            submission = submissions_by_assignment_id.get(str(raw_id)) if raw_id is not None else None
+            title = str(assignment.get("name") or assignment.get("title") or "LMS 과제").strip()
+            if raw_id is not None:
+                assignment_ids_seen.add(str(raw_id))
+            assignment_title_due_seen.add((_normalize_task_title_key(title), due_at))
+            external_id = f"ku_lms:assignment:{cid}:{raw_id or sha1((course_name + title + due_at).encode('utf-8')).hexdigest()[:16]}"
+            db.upsert_task(
+                external_id=external_id,
+                source="ku_lms",
+                due_at=due_at,
+                title=title,
+                status=_lms_calendar_assignment_status(
+                    assignment=assignment,
+                    submission=submission,
+                ),
+                metadata_json=attach_provenance(
+                    _lms_calendar_assignment_metadata(
+                        course_id=cid,
+                        course_name=course_name,
+                        assignment=assignment,
+                        submission=submission,
+                        item_type="quiz" if bool(assignment.get("is_quiz_assignment")) else "assignment",
+                    ),
+                    source="uclass_ws",
+                    confidence="high",
+                    derivation="canvas_lms_calendar_assignment",
+                ),
+                user_id=user_id,
+            )
+            upserted += 1
+            standard_task_count += 1
+
+        source_scan_enabled = standard_task_count == 0
+
+        try:
+            announcements = (
+                ku_lms.get_announcements(session, [cid])
+                if source_scan_enabled or user_terms
+                else []
+            ) or []
+        except Exception as exc:
+            announcements = []
+            failures.append({"course_id": cid, "stage": "source_announcements", "error": str(exc)})
+        for announcement in announcements:
+            if not isinstance(announcement, dict):
+                continue
+            title = str(announcement.get("title") or announcement.get("subject") or "공지").strip()
+            announcement_url = str(
+                announcement.get("html_url") or announcement.get("url") or ""
+            ).strip()
+            text_lines = [
+                title,
+                *_lms_text_lines_from_dict(
+                    announcement,
+                    ("message", "body", "description", "content"),
+                ),
+            ]
+            source_id = _lms_source_cache_id(
+                source_kind="announcement",
+                payload=announcement,
+                fallback_seed=f"{cid}|{title}",
+            )
+            body_text = "\n".join(line for line in text_lines if str(line or "").strip())
+            source_cache_stats["writes"] += 1
+            _lms_cache_source_record(
+                db,
+                user_id=user_id,
+                course_id=cid,
+                course_name=course_name,
+                source_kind="announcement",
+                source_id=source_id,
+                title=title,
+                body_text=body_text,
+                payload_json=announcement,
+                source_url=announcement_url,
+                metadata_json={"source_label": "공지"},
+            )
+            parsed_task_ids: list[str] = []
+            if source_scan_enabled:
+                parsed_task_ids.extend(
+                    persist_source_hints(
+                    _telegram_assignment_hints_from_text(
+                        title=title,
+                        course_name=course_name,
+                        source_label="공지",
+                        text_lines=text_lines,
+                        timezone_name=timezone_name,
+                        reference_local=reference_local,
+                    ),
+                        source_url=announcement_url,
+                    )
+                )
+            parsed_task_ids.extend(
+                persist_presentation_hint(
+                    _lms_calendar_presentation_hint_from_text(
+                        title=title,
+                        course_name=course_name,
+                        source_label="공지",
+                        text_lines=text_lines,
+                        timezone_name=timezone_name,
+                        reference_local=reference_local,
+                        user_terms=user_terms,
+                    ),
+                    source_url=announcement_url,
+                )
+            )
+            if parsed_task_ids:
+                db.update_lms_source_cache_parsed_tasks(
+                    user_id=user_id,
+                    course_id=cid,
+                    source_kind="announcement",
+                    source_id=source_id,
+                    parsed_task_ids=parsed_task_ids,
+                )
+
+        try:
+            modules = (
+                ku_lms.get_modules(session, cid, include_items=True)
+                if source_scan_enabled
+                else []
+            ) or []
+        except Exception as exc:
+            modules = []
+            failures.append({"course_id": cid, "stage": "source_modules", "error": str(exc)})
+        for module in modules:
+            if not isinstance(module, dict):
+                continue
+            module_name = str(module.get("name") or module.get("title") or "").strip()
+            module_lines = _lms_text_lines_from_dict(
+                module,
+                ("name", "title", "description", "unlock_at", "due_at"),
+            )
+            items = module.get("items")
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title") or item.get("name") or module_name or "자료").strip()
+                text_lines = [
+                    *module_lines,
+                    title,
+                    *_lms_text_lines_from_dict(
+                        item,
+                        (
+                            "title",
+                            "name",
+                            "type",
+                            "content_type",
+                            "html_url",
+                            "url",
+                            "due_at",
+                            "unlock_at",
+                            "completion_requirement",
+                        ),
+                    ),
+                ]
+                persist_source_hints(
+                    _telegram_assignment_hints_from_text(
+                        title=title,
+                        course_name=course_name,
+                        source_label="모듈/자료",
+                        text_lines=text_lines,
+                        timezone_name=timezone_name,
+                        reference_local=reference_local,
+                    ),
+                    source_url=str(item.get("html_url") or item.get("url") or "").strip(),
+                )
+
+        try:
+            boards = (
+                ku_lms.list_boards(session, cid)
+                if source_scan_enabled or user_terms
+                else []
+            )
+            boards = boards or []
+        except Exception as exc:
+            boards = []
+            failures.append({"course_id": cid, "stage": "source_boards", "error": str(exc)})
+        for board in boards[:TELEGRAM_LMS_BOARD_SCAN_LIMIT_PER_COURSE]:
+            if not isinstance(board, dict):
+                continue
+            bid_raw = board.get("id") or board.get("board_id")
+            try:
+                bid = int(bid_raw)
+            except (TypeError, ValueError):
+                continue
+            board_name = str(board.get("name") or board.get("title") or "게시판").strip()
+            try:
+                resp = ku_lms.list_board_posts(
+                    session,
+                    cid,
+                    bid,
+                    keyword="" if source_scan_enabled else "발표",
+                )
+            except Exception as exc:
+                failures.append({"course_id": cid, "stage": "source_board_posts", "error": str(exc)})
+                continue
+            detail_count = 0
+            post_limit = (
+                TELEGRAM_LMS_BOARD_POST_LIMIT_PER_BOARD
+                if source_scan_enabled
+                else TELEGRAM_LMS_ASSIGNMENT_BOARD_DETAIL_LIMIT_PER_BOARD
+            )
+            detail_limit = (
+                TELEGRAM_LMS_ASSIGNMENT_BOARD_DETAIL_LIMIT_PER_BOARD
+                if source_scan_enabled
+                else post_limit
+            )
+            for post in _lms_board_posts_from_response(resp)[:post_limit]:
+                title = str(post.get("title") or post.get("subject") or "게시글").strip()
+                post_id = _lms_post_id(post)
+                source_id = (
+                    f"board:{bid}:post:{post_id}"
+                    if post_id is not None
+                    else _lms_source_cache_id(
+                        source_kind="board_post",
+                        payload=post,
+                        fallback_seed=f"{cid}|{bid}|{title}",
+                    )
+                )
+                cached_source = db.get_lms_source_cache(
+                    user_id=user_id,
+                    course_id=cid,
+                    source_kind="board_post",
+                    source_id=source_id,
+                )
+                source_cache_stats["reads"] += 1
+                post_text_lines = [
+                    board_name,
+                    title,
+                    *_lms_text_lines_from_dict(
+                        post,
+                        ("title", "subject", "message", "body", "content"),
+                    ),
+                ]
+                detail_url = str(post.get("html_url") or post.get("url") or "").strip()
+                using_cached_detail = False
+                if (
+                    cached_source
+                    and _lms_source_cache_is_fresh(cached_source)
+                    and str(cached_source.get("body_text") or "").strip()
+                ):
+                    source_cache_stats["fresh_hits"] += 1
+                    using_cached_detail = True
+                    detail_url = str(cached_source.get("source_url") or detail_url).strip()
+                    post_text_lines = [
+                        line
+                        for line in str(cached_source.get("body_text") or "").splitlines()
+                        if line.strip()
+                    ]
+                if (
+                    not using_cached_detail
+                    and post_id is not None
+                    and detail_count < detail_limit
+                ):
+                    detail_count += 1
+                    try:
+                        detail = ku_lms.get_board_post(session, cid, bid, post_id) or {}
+                    except Exception as exc:
+                        detail = {}
+                        failures.append({"course_id": cid, "stage": "source_board_post_detail", "error": str(exc)})
+                        if cached_source and str(cached_source.get("body_text") or "").strip():
+                            source_cache_stats["stale_fallbacks"] += 1
+                            detail_url = str(cached_source.get("source_url") or detail_url).strip()
+                            post_text_lines = [
+                                line
+                                for line in str(cached_source.get("body_text") or "").splitlines()
+                                if line.strip()
+                            ]
+                    if isinstance(detail, dict):
+                        detail_url = str(
+                            detail.get("html_url")
+                            or detail.get("url")
+                            or detail_url
+                        ).strip()
+                        post_text_lines.extend(
+                            _lms_text_lines_from_dict(
+                                detail,
+                                (
+                                    "title",
+                                    "subject",
+                                    "message",
+                                    "body",
+                                    "content",
+                                    "description",
+                                    "attachments",
+                                    "files",
+                                ),
+                            )
+                        )
+                        source_cache_stats["writes"] += 1
+                        _lms_cache_source_record(
+                            db,
+                            user_id=user_id,
+                            course_id=cid,
+                            course_name=course_name,
+                            source_kind="board_post",
+                            source_id=source_id,
+                            title=title,
+                            body_text="\n".join(
+                                line for line in post_text_lines if str(line or "").strip()
+                            ),
+                            payload_json={
+                                "list_item": post,
+                                "detail": detail,
+                                "board_id": bid,
+                                "board_name": board_name,
+                            },
+                            source_url=detail_url,
+                            metadata_json={"source_label": f"게시판 {board_name}"},
+                        )
+                elif cached_source is None:
+                    source_cache_stats["writes"] += 1
+                    _lms_cache_source_record(
+                        db,
+                        user_id=user_id,
+                        course_id=cid,
+                        course_name=course_name,
+                        source_kind="board_post",
+                        source_id=source_id,
+                        title=title,
+                        body_text="\n".join(
+                            line for line in post_text_lines if str(line or "").strip()
+                        ),
+                        payload_json={
+                            "list_item": post,
+                            "board_id": bid,
+                            "board_name": board_name,
+                        },
+                        source_url=detail_url,
+                        metadata_json={"source_label": f"게시판 {board_name}"},
+                    )
+                parsed_task_ids = []
+                if source_scan_enabled:
+                    parsed_task_ids.extend(
+                        persist_source_hints(
+                        _telegram_assignment_hints_from_text(
+                            title=title,
+                            course_name=course_name,
+                            source_label=f"게시판 {board_name}",
+                            text_lines=post_text_lines,
+                            timezone_name=timezone_name,
+                            reference_local=reference_local,
+                        ),
+                            source_url=detail_url,
+                        )
+                    )
+                parsed_task_ids.extend(
+                    persist_presentation_hint(
+                        _lms_calendar_presentation_hint_from_text(
+                            title=title,
+                            course_name=course_name,
+                            source_label=f"게시판 {board_name}",
+                            text_lines=post_text_lines,
+                            timezone_name=timezone_name,
+                            reference_local=reference_local,
+                            user_terms=user_terms,
+                        ),
+                        source_url=detail_url,
+                    )
+                )
+                if parsed_task_ids:
+                    db.update_lms_source_cache_parsed_tasks(
+                        user_id=user_id,
+                        course_id=cid,
+                        source_kind="board_post",
+                        source_id=source_id,
+                        parsed_task_ids=parsed_task_ids,
+                    )
+
+        try:
+            quizzes = ku_lms.get_quizzes(session, cid) or []
+        except Exception as exc:
+            quizzes = []
+            failures.append({"course_id": cid, "stage": "quizzes", "error": str(exc)})
+        for quiz in quizzes:
+            if not isinstance(quiz, dict):
+                continue
+            due_at = _lms_calendar_item_due_at(quiz)
+            if not due_at:
+                continue
+            raw_id = quiz.get("id") or quiz.get("assignment_id")
+            assignment_id = quiz.get("assignment_id")
+            title = str(quiz.get("title") or quiz.get("name") or "LMS 퀴즈").strip()
+            if assignment_id is not None and str(assignment_id) in assignment_ids_seen:
+                continue
+            if (_normalize_task_title_key(title), due_at) in assignment_title_due_seen:
+                continue
+            external_id = f"ku_lms:quiz:{cid}:{raw_id or sha1((course_name + title + due_at).encode('utf-8')).hexdigest()[:16]}"
+            db.upsert_task(
+                external_id=external_id,
+                source="ku_lms",
+                due_at=due_at,
+                title=title,
+                status="open",
+                metadata_json=attach_provenance(
+                    _lms_calendar_assignment_metadata(
+                        course_id=cid,
+                        course_name=course_name,
+                        assignment=quiz,
+                        item_type="quiz",
+                    ),
+                    source="uclass_ws",
+                    confidence="high",
+                    derivation="canvas_lms_calendar_quiz",
+                ),
+                user_id=user_id,
+            )
+            upserted += 1
+            standard_task_count += 1
+
+        if standard_task_count == 0:
+            for hint, source_url in source_hint_pending:
+                due_at = str(hint.due_at or "").strip()
+                title = str(hint.title or "").strip()
+                title_due_key = (_normalize_task_title_key(title), due_at)
+                if title_due_key in assignment_title_due_seen:
+                    continue
+                external_id = _lms_calendar_persist_source_hint(
+                    db,
+                    user_id=user_id,
+                    course_id=cid,
+                    course_name=course_name,
+                    hint=hint,
+                    source_url=source_url,
+                )
+                if external_id:
+                    assignment_title_due_seen.add(title_due_key)
+                    upserted += 1
+
+    return {
+        "ok": not failures,
+        "scanned_courses": scanned_courses,
+        "upserted_tasks": upserted,
+        "failures": failures,
+        "source_cache": source_cache_stats,
+    }
+
+
+def sync_google_calendar(settings: Settings, db: Database) -> dict[str, Any]:
+    if not _google_calendar_enabled(settings):
+        return {"skipped": True, "reason": "GOOGLE_CALENDAR_SYNC_ENABLED is false"}
+
+    config_error = _google_calendar_config_error(settings)
+    if config_error:
+        _record_sync_dashboard_state(
+            db,
+            "sync_google_calendar",
+            status="error",
+            action_required=1,
+            last_error=config_error,
+            cursor_payload={"skipped": True, "reason": config_error},
+        )
+        return {"ok": False, "error": config_error}
+
+    calendar_id = str(getattr(settings, "google_calendar_id", "primary") or "primary")
+    timezone_name = str(getattr(settings, "timezone", "Asia/Seoul") or "Asia/Seoul")
+    duration_min = int(getattr(settings, "google_calendar_task_duration_min", 30) or 30)
+    window_days = int(getattr(settings, "google_calendar_sync_window_days", 120) or 120)
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    until = now + timedelta(days=max(window_days, 1))
+
+    client = GoogleCalendarClient.from_oauth_token_file(
+        token_file=Path(getattr(settings, "google_calendar_token_file")),
+        credentials_file=getattr(settings, "google_calendar_credentials_file", None),
+        calendar_id=calendar_id,
+    )
+
+    candidates: list[tuple[str, dict[str, Any]]] = []
+    selected_tasks = 0
+    selected_events = 0
+    lms_sync_results: list[dict[str, Any]] = []
+    for user_id in _google_calendar_sync_user_ids(db):
+        user = db.get_user(user_id) if user_id > 0 else None
+        chat_id = user.get("telegram_chat_id") if isinstance(user, dict) else None
+        lms_result = _lms_calendar_persist_canvas_records(
+            settings,
+            db,
+            user_id=user_id,
+            chat_id=chat_id,
+        )
+        lms_sync_results.append({"user_id": user_id, **lms_result})
+        tasks = _google_calendar_candidate_tasks(db, user_id=user_id)
+        seen_task_keys: set[tuple[str, str, str]] = set()
+        for task in tasks:
+            if not _task_should_sync_to_google_calendar(task):
+                continue
+            dedupe_key = _task_google_calendar_dedupe_key(
+                task,
+                timezone_name=timezone_name,
+            )
+            if dedupe_key in seen_task_keys:
+                continue
+            seen_task_keys.add(dedupe_key)
+            payload = _task_google_calendar_payload(
+                task,
+                timezone_name=timezone_name,
+                duration_min=duration_min,
+            )
+            if payload:
+                candidates.append(payload)
+                selected_tasks += 1
+
+        for event in db.list_events(limit=1000, user_id=user_id):
+            start_at = _parse_dt(event.start_at)
+            if not start_at or start_at > until:
+                continue
+            if not _event_should_sync_to_google_calendar(event):
+                continue
+            payload = _event_google_calendar_payload(event, timezone_name=timezone_name)
+            if payload:
+                candidates.append(payload)
+                selected_events += 1
+
+    created = 0
+    updated = 0
+    failures: list[dict[str, Any]] = []
+    for event_id, payload in candidates:
+        try:
+            result = client.upsert_event(event_id=event_id, payload=payload)
+        except Exception as exc:
+            failures.append(
+                {
+                    "event_id": event_id,
+                    "summary": str(payload.get("summary") or ""),
+                    "error": str(exc),
+                }
+            )
+            continue
+        if result.action == "created":
+            created += 1
+        else:
+            updated += 1
+
+    status = "error" if failures else "success"
+    result = {
+        "ok": not failures,
+        "calendar_id": calendar_id,
+        "selected_tasks": selected_tasks,
+        "selected_events": selected_events,
+        "upserted_events": created + updated,
+        "created_events": created,
+        "updated_events": updated,
+        "failed_events": failures,
+        "lms_sync": lms_sync_results,
+    }
+    _record_sync_dashboard_state(
+        db,
+        "sync_google_calendar",
+        status=status,
+        new_items=created + updated,
+        action_required=len(failures),
+        last_error=str(failures[0]["error"]) if failures else None,
+        cursor_payload=result,
+    )
+    return result
 
 
 def _weather_target_cache_key(target: dict[str, Any]) -> str:
@@ -16762,6 +18226,7 @@ def run_all_jobs(
     jobs = [
         ("sync_uclass", sync_uclass),
         ("sync_ku_portal_timetable", sync_ku_portal_timetable),
+        ("sync_google_calendar", sync_google_calendar),
         ("sync_weather", sync_weather),
         ("sync_telegram", sync_telegram),
         ("scheduled_briefings", send_scheduled_briefings),
