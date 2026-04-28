@@ -76,5 +76,4 @@ dump*.sql
 .claude/
 .playwright-mcp/
 _reference/
-.omc/project-memory.json
-.omc/state/
+.omc/
