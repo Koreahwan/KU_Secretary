@@ -3030,6 +3030,7 @@ class Database:
         status: str,
         metadata_json: dict[str, Any] | None,
         user_id: int | None = 0,
+        preserve_done_open: bool = True,
     ) -> Task:
         ts = now_utc_iso()
         due_at_norm = normalize_datetime(due_at)
@@ -3049,11 +3050,11 @@ class Database:
                     due_at = excluded.due_at,
                     title = excluded.title,
                     status = CASE
-                        WHEN tasks.status IN ('done', 'ignored') AND excluded.status = 'open' THEN tasks.status
+                        WHEN ? AND tasks.status IN ('done', 'ignored') AND excluded.status = 'open' THEN tasks.status
                         ELSE excluded.status
                     END,
                     metadata_json = CASE
-                        WHEN tasks.status IN ('done', 'ignored') AND excluded.status = 'open' THEN tasks.metadata_json
+                        WHEN ? AND tasks.status IN ('done', 'ignored') AND excluded.status = 'open' THEN tasks.metadata_json
                         ELSE excluded.metadata_json
                     END,
                     updated_at = excluded.updated_at
@@ -3068,6 +3069,8 @@ class Database:
                     metadata,
                     ts,
                     ts,
+                    1 if preserve_done_open else 0,
+                    1 if preserve_done_open else 0,
                 ),
             )
         return Task(

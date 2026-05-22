@@ -6135,6 +6135,10 @@ GOOGLE_CALENDAR_ACADEMIC_EVENT_RE = re.compile(
     r"\bpresentation\b|\bpresent\b|\bhw\b|\bhomework\b|\bassignment\b|\breport\b|\bproject\b)",
     re.IGNORECASE,
 )
+GOOGLE_CALENDAR_MANUAL_COLOR_EVENT_RE = re.compile(r"(기해실|\bcykor\b)", re.IGNORECASE)
+GOOGLE_CALENDAR_COLOR_ACTIVE = "9"  # blue
+GOOGLE_CALENDAR_COLOR_COMPLETED = "8"  # gray
+GOOGLE_CALENDAR_COLOR_SYNC_WINDOW_DAYS = 365
 
 
 def _google_calendar_enabled(settings: Settings) -> bool:
@@ -6235,6 +6239,10 @@ def _calendar_category(
     return default
 
 
+def _calendar_color_id(*, completed: bool) -> str:
+    return GOOGLE_CALENDAR_COLOR_COMPLETED if completed else GOOGLE_CALENDAR_COLOR_ACTIVE
+
+
 def _calendar_dt(value: str | None, timezone_name: str) -> datetime | None:
     parsed = _parse_dt(value)
     if not parsed:
@@ -6313,6 +6321,11 @@ def _task_completed_for_calendar_display(task: Task, due_at: datetime) -> bool:
     return due_at < now
 
 
+def _event_completed_for_calendar_display(end_at: datetime) -> bool:
+    now = datetime.now(end_at.tzinfo or timezone.utc)
+    return end_at < now
+
+
 def _task_google_calendar_payload(
     task: Task,
     *,
@@ -6346,6 +6359,7 @@ def _task_google_calendar_payload(
         ),
         "start": {"date": start_date},
         "end": {"date": end_date},
+        "colorId": _calendar_color_id(completed=completed),
         "reminders": {"useDefault": False, "overrides": []},
         "extendedProperties": {
             "private": {
@@ -6374,21 +6388,27 @@ def _event_google_calendar_payload(
     start_date, end_date = _calendar_all_day_bounds(start_at)
     metadata = _calendar_item_metadata(event.metadata_json)
     category = _calendar_category(event.title, metadata=metadata, default="일정")
+    completed = _event_completed_for_calendar_display(end_at)
+    summary = _calendar_summary(event.title, metadata, category, when=start_at)
+    if completed:
+        summary = _strikethrough_text(summary)
     event_id = google_calendar_event_id(
         user_id=event.user_id,
         source=event.source,
         external_id=event.external_id,
     )
     payload = {
-        "summary": _calendar_summary(event.title, metadata, category, when=start_at),
+        "summary": summary,
         "description": _calendar_description(
             kind=category,
             title=event.title,
             metadata=metadata,
             when_label=f"시작: {start_at.isoformat()}",
+            status_label="완료" if completed else None,
         ),
         "start": {"date": start_date},
         "end": {"date": end_date},
+        "colorId": _calendar_color_id(completed=completed),
         "location": event.location or "",
         "reminders": {"useDefault": False, "overrides": []},
         "extendedProperties": {
@@ -6435,6 +6455,133 @@ def _event_should_sync_to_google_calendar(event: Event) -> bool:
     if source == "review" or event.external_id.startswith("review:"):
         return False
     return bool(GOOGLE_CALENDAR_ACADEMIC_EVENT_RE.search(str(event.title or "")))
+
+
+def _google_event_text(event: dict[str, Any]) -> str:
+    parts = [
+        str(event.get("summary") or ""),
+        str(event.get("description") or ""),
+        str(event.get("location") or ""),
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _google_event_is_academic(event: dict[str, Any]) -> bool:
+    text = _google_event_text(event)
+    return bool(
+        GOOGLE_CALENDAR_ACADEMIC_EVENT_RE.search(text)
+        or GOOGLE_CALENDAR_MANUAL_COLOR_EVENT_RE.search(text)
+    )
+
+
+def _google_event_boundary_dt(
+    value: Any,
+    *,
+    timezone_name: str,
+) -> datetime | None:
+    if not isinstance(value, dict):
+        return None
+    date_time = str(value.get("dateTime") or "").strip()
+    if date_time:
+        return _calendar_dt(date_time, timezone_name)
+    date_value = str(value.get("date") or "").strip()
+    if not date_value:
+        return None
+    try:
+        parsed_date = datetime.fromisoformat(date_value).date()
+    except Exception:
+        return None
+    try:
+        tz = ZoneInfo(str(timezone_name or "Asia/Seoul"))
+    except Exception:
+        tz = timezone.utc
+    return datetime.combine(parsed_date, datetime.min.time(), tzinfo=tz)
+
+
+def _google_event_completed_for_color(
+    event: dict[str, Any],
+    *,
+    timezone_name: str,
+    now: datetime,
+) -> bool:
+    summary = str(event.get("summary") or "")
+    if "[완료]" in summary:
+        return True
+    end_at = _google_event_boundary_dt(event.get("end"), timezone_name=timezone_name)
+    if end_at is None:
+        return False
+    return end_at <= now.astimezone(end_at.tzinfo or timezone.utc)
+
+
+def _google_event_completion_summary(event: dict[str, Any]) -> str | None:
+    summary = str(event.get("summary") or "").strip()
+    if not summary or "[완료]" in summary:
+        return None
+    return _strikethrough_text(summary)
+
+
+def _sync_google_calendar_academic_colors(
+    client: Any,
+    *,
+    time_min: datetime,
+    time_max: datetime,
+    timezone_name: str,
+) -> dict[str, Any]:
+    if not hasattr(client, "list_events") or not hasattr(client, "patch_event_color"):
+        return {"skipped": True, "reason": "client does not support event color sync"}
+    events = client.list_events(time_min=time_min, time_max=time_max)
+    scanned = 0
+    updated = 0
+    skipped = 0
+    failures: list[dict[str, Any]] = []
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    for event in events:
+        if not _google_event_is_academic(event):
+            continue
+        scanned += 1
+        event_id = str(event.get("id") or "").strip()
+        if not event_id:
+            skipped += 1
+            continue
+        completed = _google_event_completed_for_color(
+            event,
+            timezone_name=timezone_name,
+            now=now,
+        )
+        target_color = _calendar_color_id(
+            completed=completed
+        )
+        target_summary = _google_event_completion_summary(event) if completed else None
+        color_matches = str(event.get("colorId") or "").strip() == target_color
+        if color_matches and not target_summary:
+            skipped += 1
+            continue
+        try:
+            if target_summary and hasattr(client, "patch_event_completion_marker"):
+                client.patch_event_completion_marker(
+                    event_id=event_id,
+                    summary=target_summary,
+                    color_id=target_color,
+                )
+            else:
+                client.patch_event_color(event_id=event_id, color_id=target_color)
+        except Exception as exc:
+            failures.append(
+                {
+                    "event_id": event_id,
+                    "summary": str(event.get("summary") or ""),
+                    "error": str(exc),
+                }
+            )
+            continue
+        updated += 1
+    return {
+        "ok": not failures,
+        "scanned_events": scanned,
+        "updated_events": updated,
+        "skipped_events": skipped,
+        "failed_events": failures,
+    }
 
 
 def _google_calendar_sync_user_ids(db: Database) -> list[int]:
@@ -6497,6 +6644,8 @@ def _lms_calendar_assignment_status(
     workflow_state = str(sub.get("workflow_state") or "").strip().lower()
     if submitted_at or workflow_state in {"submitted", "graded", "pending_review"}:
         return "done"
+    if workflow_state in {"unsubmitted", "missing", "pending_upload", "created"}:
+        return "open"
     if bool(sub.get("missing")):
         return "open"
     if bool(assignment.get("has_submitted_submissions")):
@@ -6942,6 +7091,7 @@ def _lms_calendar_persist_canvas_records(
                     derivation="canvas_lms_calendar_submission",
                 ),
                 user_id=user_id,
+                preserve_done_open=False,
             )
             upserted += 1
             standard_task_count += 1
@@ -7056,6 +7206,7 @@ def _lms_calendar_persist_canvas_records(
                     derivation="canvas_lms_calendar_assignment",
                 ),
                 user_id=user_id,
+                preserve_done_open=False,
             )
             upserted += 1
             standard_task_count += 1
@@ -7489,6 +7640,8 @@ def sync_google_calendar(settings: Settings, db: Database) -> dict[str, Any]:
     duration_min = int(getattr(settings, "google_calendar_task_duration_min", 30) or 30)
     window_days = int(getattr(settings, "google_calendar_sync_window_days", 120) or 120)
     now = datetime.now(timezone.utc).replace(microsecond=0)
+    color_window_days = max(window_days, GOOGLE_CALENDAR_COLOR_SYNC_WINDOW_DAYS)
+    since = now - timedelta(days=max(color_window_days, 1))
     until = now + timedelta(days=max(window_days, 1))
 
     client = GoogleCalendarClient.from_oauth_token_file(
@@ -7545,6 +7698,9 @@ def sync_google_calendar(settings: Settings, db: Database) -> dict[str, Any]:
 
     created = 0
     updated = 0
+    color_updated = 0
+    skipped = 0
+    skipped_events: list[dict[str, Any]] = []
     failures: list[dict[str, Any]] = []
     for event_id, payload in candidates:
         try:
@@ -7560,8 +7716,48 @@ def sync_google_calendar(settings: Settings, db: Database) -> dict[str, Any]:
             continue
         if result.action == "created":
             created += 1
-        else:
+        elif result.action == "updated":
             updated += 1
+        elif result.action == "color_updated":
+            color_updated += 1
+            skipped += 1
+            skipped_events.append(
+                {
+                    "event_id": event_id,
+                    "summary": str(payload.get("summary") or ""),
+                    "reason": str(getattr(result, "reason", "") or "color_updated_only"),
+                    "color_updated": True,
+                }
+            )
+        elif result.action == "skipped":
+            skipped += 1
+            skipped_events.append(
+                {
+                    "event_id": event_id,
+                    "summary": str(payload.get("summary") or ""),
+                    "reason": str(getattr(result, "reason", "") or "skipped"),
+                }
+            )
+
+    color_sync = _sync_google_calendar_academic_colors(
+        client,
+        time_min=since,
+        time_max=until,
+        timezone_name=timezone_name,
+    )
+    color_failures = list(color_sync.get("failed_events") or []) if isinstance(color_sync, dict) else []
+    if color_failures:
+        failures.extend(
+            {
+                "event_id": str(item.get("event_id") or ""),
+                "summary": str(item.get("summary") or ""),
+                "error": str(item.get("error") or "color sync failed"),
+            }
+            for item in color_failures
+            if isinstance(item, dict)
+        )
+    if isinstance(color_sync, dict):
+        color_updated += int(color_sync.get("updated_events") or 0)
 
     status = "error" if failures else "success"
     result = {
@@ -7572,6 +7768,10 @@ def sync_google_calendar(settings: Settings, db: Database) -> dict[str, Any]:
         "upserted_events": created + updated,
         "created_events": created,
         "updated_events": updated,
+        "color_updated_events": color_updated,
+        "color_sync": color_sync,
+        "skipped_events": skipped,
+        "skipped_event_details": skipped_events,
         "failed_events": failures,
         "lms_sync": lms_sync_results,
     }
@@ -10871,7 +11071,7 @@ def _format_telegram_assignments(
     chat_id: str | int | None = None,
     force_refresh: bool = False,
 ) -> str:
-    """Render Canvas LMS todo + upcoming events for /assignments replies.
+    """Render actionable Canvas LMS assignments for /assignments replies.
 
     Live hit on mylms.korea.ac.kr (cached 25 min by ku-portal-mcp lms session).
     """
@@ -10982,6 +11182,43 @@ def _format_telegram_assignments(
         assignment_scan_failures += 1
     course_ids: list[int] = []
     course_name_by_id: dict[int, str] = {}
+
+    def _submission_indicates_completed(submission: dict[str, Any] | None) -> bool:
+        if not isinstance(submission, dict):
+            return False
+        if bool(submission.get("missing")) and not submission.get("submitted_at"):
+            return False
+        workflow_state = str(submission.get("workflow_state") or "").strip().lower()
+        if workflow_state in {"submitted", "graded", "pending_review"}:
+            return True
+        return bool(submission.get("submitted_at"))
+
+    def _assignment_is_gradebook_placeholder(assignment: dict[str, Any]) -> bool:
+        name = str(assignment.get("name") or assignment.get("title") or "").strip()
+        if assignment.get("due_at") or assignment.get("lock_at") or assignment.get("unlock_at"):
+            return False
+        description = _lms_plain_text(assignment.get("description") or "").strip()
+        if description:
+            return False
+        submission_types = assignment.get("submission_types")
+        if isinstance(submission_types, list) and any(
+            str(item or "").strip() not in {"", "none"} for item in submission_types
+        ):
+            return False
+        return name in {"출석", "가점", "중간시험", "기말시험"}
+
+    def _assignment_is_open_for_submission(
+        assignment: dict[str, Any],
+        submission: dict[str, Any] | None,
+    ) -> bool:
+        if bool(assignment.get("has_submitted_submissions")):
+            return False
+        if _submission_indicates_completed(submission):
+            return False
+        if _assignment_is_gradebook_placeholder(assignment):
+            return False
+        return True
+
     for course in _lms_scannable_courses(courses)[:TELEGRAM_LMS_COURSE_SCAN_LIMIT]:
         if not isinstance(course, dict):
             continue
@@ -10991,13 +11228,34 @@ def _format_telegram_assignments(
         course_ids.append(cid)
         course_name_by_id[cid] = course_name
         scanned_courses += 1
+        submissions_by_assignment_id: dict[str, dict[str, Any]] = {}
         try:
-            assignments = ku_lms.get_assignments(session, cid, upcoming_only=True) or []
+            submissions = ku_lms.get_submissions(session, cid) or []
+        except Exception:
+            submissions = []
+            assignment_scan_failures += 1
+        for submission in submissions:
+            if not isinstance(submission, dict):
+                continue
+            assignment = submission.get("assignment") if isinstance(submission.get("assignment"), dict) else {}
+            raw_id = submission.get("assignment_id") or assignment.get("id")
+            if raw_id is not None:
+                submissions_by_assignment_id[str(raw_id)] = submission
+        try:
+            assignments = ku_lms.get_assignments(session, cid, upcoming_only=False) or []
         except Exception:
             assignment_scan_failures += 1
             continue
         for assignment in assignments:
             if not isinstance(assignment, dict):
+                continue
+            raw_assignment_id = assignment.get("id") or assignment.get("assignment_id")
+            submission = (
+                submissions_by_assignment_id.get(str(raw_assignment_id))
+                if raw_assignment_id is not None
+                else None
+            )
+            if not _assignment_is_open_for_submission(assignment, submission):
                 continue
             key = _assignment_key(assignment)
             if key and key in seen_assignment_keys:

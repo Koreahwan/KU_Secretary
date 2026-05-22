@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 from ku_secretary.connectors.google_calendar import (
     GoogleCalendarClient,
+    _managed_payload_hash,
+    _managed_payload_hash_v1,
     google_calendar_event_id,
 )
 from ku_secretary.db import Database
@@ -37,6 +39,24 @@ class _FakeGoogleSession:
         return _FakeResponse(200, {"htmlLink": "https://calendar.google/item"})
 
 
+def _managed_google_payload() -> dict:
+    return {
+        "summary": "Algorithms 과제",
+        "description": "내용: HW 1",
+        "start": {"date": "2026-05-01"},
+        "end": {"date": "2026-05-02"},
+        "reminders": {"useDefault": False, "overrides": []},
+        "extendedProperties": {
+            "private": {
+                "ku_secretary_kind": "task",
+                "ku_secretary_external_id": "uclass:assign:1",
+                "ku_secretary_source": "uclass",
+                "ku_secretary_user_id": "7",
+            }
+        },
+    }
+
+
 def test_google_calendar_client_inserts_after_missing_update() -> None:
     session = _FakeGoogleSession()
     client = GoogleCalendarClient(
@@ -58,6 +78,184 @@ def test_google_calendar_client_inserts_after_missing_update() -> None:
     assert result.action == "created"
     assert [item[0] for item in session.requests] == ["PUT", "POST"]
     assert session.requests[1][2]["json"]["id"] == "kus12345"
+
+
+def test_google_calendar_client_does_not_overwrite_manual_event_with_same_id() -> None:
+    class _ManualEventSession:
+        def __init__(self):
+            self.requests: list[tuple[str, str, dict]] = []
+
+        def request(self, method: str, url: str, **kwargs):
+            self.requests.append((method, url, kwargs))
+            assert method == "GET"
+            return _FakeResponse(
+                200,
+                {
+                    "id": "kus12345",
+                    "summary": "내가 직접 추가한 일정",
+                    "start": {"date": "2026-05-01"},
+                    "end": {"date": "2026-05-02"},
+                    "htmlLink": "https://calendar.google/manual",
+                },
+            )
+
+    session = _ManualEventSession()
+    client = GoogleCalendarClient(
+        access_token="token",
+        calendar_id="primary",
+        session=session,
+        api_base="https://calendar.example",
+    )
+
+    result = client.upsert_event(event_id="kus12345", payload=_managed_google_payload())
+
+    assert result.action == "skipped"
+    assert result.reason == "not_ku_secretary_event"
+    assert [item[0] for item in session.requests] == ["GET"]
+
+
+def test_google_calendar_client_does_not_overwrite_manually_edited_managed_event() -> None:
+    payload = _managed_google_payload()
+    existing = json.loads(json.dumps(payload))
+    existing["summary"] = "내가 직접 고친 제목"
+    existing["extendedProperties"]["private"]["ku_secretary_payload_hash"] = "old-managed-hash"
+
+    class _EditedEventSession:
+        def __init__(self):
+            self.requests: list[tuple[str, str, dict]] = []
+
+        def request(self, method: str, url: str, **kwargs):
+            self.requests.append((method, url, kwargs))
+            assert method == "GET"
+            return _FakeResponse(200, existing)
+
+    session = _EditedEventSession()
+    client = GoogleCalendarClient(
+        access_token="token",
+        calendar_id="primary",
+        session=session,
+        api_base="https://calendar.example",
+    )
+
+    result = client.upsert_event(event_id="kus12345", payload=payload)
+
+    assert result.action == "skipped"
+    assert result.reason == "manual_changes_detected"
+    assert [item[0] for item in session.requests] == ["GET"]
+
+
+def test_google_calendar_client_allows_managed_color_refresh() -> None:
+    payload = _managed_google_payload()
+    payload["colorId"] = "9"
+    existing = json.loads(json.dumps(payload))
+    existing["extendedProperties"]["private"]["ku_secretary_payload_hash_v2"] = (
+        _managed_payload_hash(payload)
+    )
+    existing["colorId"] = "8"
+
+    class _ColorEditedEventSession:
+        def __init__(self):
+            self.requests: list[tuple[str, str, dict]] = []
+
+        def request(self, method: str, url: str, **kwargs):
+            self.requests.append((method, url, kwargs))
+            if method == "GET":
+                return _FakeResponse(200, existing)
+            if method == "PUT":
+                assert kwargs["json"]["colorId"] == "9"
+                return _FakeResponse(200, {"htmlLink": "https://calendar.google/item"})
+            raise AssertionError(method)
+
+    session = _ColorEditedEventSession()
+    client = GoogleCalendarClient(
+        access_token="token",
+        calendar_id="primary",
+        session=session,
+        api_base="https://calendar.example",
+    )
+
+    result = client.upsert_event(event_id="kus12345", payload=payload)
+
+    assert result.action == "updated"
+    assert [item[0] for item in session.requests] == ["GET", "PUT"]
+
+
+def test_google_calendar_client_keeps_legacy_hash_compatible_for_color_refresh() -> None:
+    payload = _managed_google_payload()
+    payload["colorId"] = "9"
+    existing = json.loads(json.dumps(payload))
+    existing["extendedProperties"]["private"]["ku_secretary_payload_hash"] = (
+        _managed_payload_hash_v1(payload)
+    )
+    existing["extendedProperties"]["private"]["ku_secretary_payload_hash_v2"] = (
+        "legacy-color-sensitive-hash"
+    )
+    existing["colorId"] = "8"
+
+    class _LegacyHashColorSession:
+        def __init__(self):
+            self.requests: list[tuple[str, str, dict]] = []
+
+        def request(self, method: str, url: str, **kwargs):
+            self.requests.append((method, url, kwargs))
+            if method == "GET":
+                return _FakeResponse(200, existing)
+            if method == "PUT":
+                assert kwargs["json"]["colorId"] == "9"
+                return _FakeResponse(200, {"htmlLink": "https://calendar.google/item"})
+            raise AssertionError(method)
+
+    session = _LegacyHashColorSession()
+    client = GoogleCalendarClient(
+        access_token="token",
+        calendar_id="primary",
+        session=session,
+        api_base="https://calendar.example",
+    )
+
+    result = client.upsert_event(event_id="kus12345", payload=payload)
+
+    assert result.action == "updated"
+    assert [item[0] for item in session.requests] == ["GET", "PUT"]
+
+
+def test_google_calendar_client_does_not_overwrite_manually_rescheduled_event() -> None:
+    payload = _managed_google_payload()
+    payload["colorId"] = "9"
+    existing = json.loads(json.dumps(payload))
+    existing["extendedProperties"]["private"]["ku_secretary_payload_hash_v2"] = (
+        _managed_payload_hash(payload)
+    )
+    existing["start"] = {"date": "2026-05-03"}
+    existing["end"] = {"date": "2026-05-04"}
+    existing["colorId"] = "8"
+
+    class _RescheduledEventSession:
+        def __init__(self):
+            self.requests: list[tuple[str, str, dict]] = []
+
+        def request(self, method: str, url: str, **kwargs):
+            self.requests.append((method, url, kwargs))
+            if method == "GET":
+                return _FakeResponse(200, existing)
+            if method == "PATCH":
+                assert kwargs["json"] == {"colorId": "9"}
+                return _FakeResponse(200, {"htmlLink": "https://calendar.google/item"})
+            raise AssertionError(method)
+
+    session = _RescheduledEventSession()
+    client = GoogleCalendarClient(
+        access_token="token",
+        calendar_id="primary",
+        session=session,
+        api_base="https://calendar.example",
+    )
+
+    result = client.upsert_event(event_id="kus12345", payload=payload)
+
+    assert result.action == "color_updated"
+    assert result.reason == "manual_changes_detected"
+    assert [item[0] for item in session.requests] == ["GET", "PATCH"]
 
 
 def test_google_calendar_event_id_is_stable() -> None:
@@ -103,6 +301,13 @@ def test_sync_google_calendar_upserts_uclass_tasks_and_exam_events(
     )
     event_start = (due_at + timedelta(days=2)).replace(hour=15, minute=30, second=0)
     event_end = event_start + timedelta(hours=1)
+    past_event_start = (datetime.now().astimezone() - timedelta(days=2)).replace(
+        hour=10,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    past_event_end = past_event_start + timedelta(hours=1)
     db.upsert_task(
         external_id="uclass:assign:1",
         source="uclass",
@@ -138,6 +343,16 @@ def test_sync_google_calendar_upserts_uclass_tasks_and_exam_events(
         location="Room 1",
         rrule=None,
         metadata_json={},
+    )
+    db.upsert_event(
+        external_id="uclass:event:presentation-past",
+        source="uclass",
+        start=past_event_start.isoformat(),
+        end=past_event_end.isoformat(),
+        title="Final presentation",
+        location="Room 2",
+        rrule=None,
+        metadata_json={"course_name": "Media Studies"},
     )
     db.upsert_task(
         external_id="inbox:deadline:1",
@@ -178,8 +393,8 @@ def test_sync_google_calendar_upserts_uclass_tasks_and_exam_events(
 
     assert result["ok"] is True
     assert result["selected_tasks"] == 4
-    assert result["selected_events"] == 1
-    assert result["created_events"] == 5
+    assert result["selected_events"] == 2
+    assert result["created_events"] == 6
     summaries = [payload["summary"] for _, payload in calls]
     assert "Algorithms 과제" in summaries
     assert "Algorithms 00분반 과제" not in summaries
@@ -189,6 +404,7 @@ def test_sync_google_calendar_upserts_uclass_tasks_and_exam_events(
     assert "Computer Security 시험" not in summaries
     assert "Algorithms 퀴즈 15:30" in summaries
     assert "Algorithms 05분반 퀴즈 15:30" not in summaries
+    assert "Studies 발표 10:00 [완료]" in summaries
     hw_payload = next(payload for _, payload in calls if payload["summary"] == "Algorithms 과제")
     past_payload = next(payload for _, payload in calls if "Final exam" in payload["description"])
     assert hw_payload["start"] == {"date": due_at.date().isoformat()}
@@ -199,7 +415,9 @@ def test_sync_google_calendar_upserts_uclass_tasks_and_exam_events(
     assert "분류:" not in hw_payload["description"]
     assert "과목:" not in hw_payload["description"]
     assert "외부 ID" not in hw_payload["description"]
+    assert hw_payload["colorId"] == pipeline.GOOGLE_CALENDAR_COLOR_ACTIVE
     assert past_payload["summary"].endswith(" [완료]")
+    assert past_payload["colorId"] == pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED
     assert "\u0336" not in past_payload["summary"]
     assert "상태: 완료" in past_payload["description"]
     timed_payload = next(payload for _, payload in calls if payload["summary"] == "Law 과제 15:00")
@@ -209,6 +427,187 @@ def test_sync_google_calendar_upserts_uclass_tasks_and_exam_events(
     assert event_payload["start"] == {"date": event_start.date().isoformat()}
     assert event_payload["end"] == {"date": (event_start.date() + timedelta(days=1)).isoformat()}
     assert event_payload["reminders"] == {"useDefault": False, "overrides": []}
+    past_event_payload = next(
+        payload for _, payload in calls if payload["summary"] == "Studies 발표 10:00 [완료]"
+    )
+    assert past_event_payload["start"] == {"date": past_event_start.date().isoformat()}
+    assert past_event_payload["end"] == {
+        "date": (past_event_start.date() + timedelta(days=1)).isoformat()
+    }
+    assert past_event_payload["colorId"] == pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED
+    assert "상태: 완료" in past_event_payload["description"]
+
+
+def test_google_calendar_color_sync_updates_academic_events_even_when_user_created() -> None:
+    now = datetime.now().astimezone().replace(microsecond=0)
+    future_end = now + timedelta(days=2)
+    past_end = now - timedelta(days=1)
+
+    class _FakeColorClient:
+        def __init__(self):
+            self.patches: list[tuple[str, str]] = []
+
+        def list_events(self, **kwargs):
+            return [
+                {
+                    "id": "manual-assignment",
+                    "summary": "직접 넣은 과제",
+                    "end": {"dateTime": future_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED,
+                },
+                {
+                    "id": "manual-exam",
+                    "summary": "직접 넣은 시험",
+                    "end": {"dateTime": past_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_ACTIVE,
+                },
+                {
+                    "id": "manual-lab",
+                    "summary": "기해실",
+                    "end": {"dateTime": future_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED,
+                },
+                {
+                    "id": "manual-cykor",
+                    "summary": "Cykor",
+                    "end": {"dateTime": past_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_ACTIVE,
+                },
+                {
+                    "id": "personal",
+                    "summary": "개인 약속",
+                    "end": {"dateTime": future_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED,
+                },
+            ]
+
+        def patch_event_color(self, *, event_id: str, color_id: str):
+            self.patches.append((event_id, color_id))
+            return SimpleNamespace(action="color_updated")
+
+    client = _FakeColorClient()
+    result = pipeline._sync_google_calendar_academic_colors(
+        client,
+        time_min=now - timedelta(days=30),
+        time_max=now + timedelta(days=30),
+        timezone_name="Asia/Seoul",
+    )
+
+    assert result["ok"] is True
+    assert result["scanned_events"] == 4
+    assert result["updated_events"] == 4
+    assert client.patches == [
+        ("manual-assignment", pipeline.GOOGLE_CALENDAR_COLOR_ACTIVE),
+        ("manual-exam", pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED),
+        ("manual-lab", pipeline.GOOGLE_CALENDAR_COLOR_ACTIVE),
+        ("manual-cykor", pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED),
+    ]
+
+
+def test_google_calendar_color_sync_marks_past_manual_events_complete() -> None:
+    now = datetime.now().astimezone().replace(microsecond=0)
+    past_end = now - timedelta(days=1)
+
+    class _FakeCompletionClient:
+        def __init__(self):
+            self.color_patches: list[tuple[str, str]] = []
+            self.completion_patches: list[tuple[str, str, str]] = []
+
+        def list_events(self, **kwargs):
+            return [
+                {
+                    "id": "manual-presentation",
+                    "summary": "사이버기술과법 발표",
+                    "end": {"dateTime": past_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED,
+                },
+                {
+                    "id": "manual-cykor",
+                    "summary": "Cykor",
+                    "end": {"dateTime": past_end.isoformat()},
+                    "colorId": pipeline.GOOGLE_CALENDAR_COLOR_ACTIVE,
+                },
+            ]
+
+        def patch_event_color(self, *, event_id: str, color_id: str):
+            self.color_patches.append((event_id, color_id))
+            return SimpleNamespace(action="color_updated")
+
+        def patch_event_completion_marker(self, *, event_id: str, summary: str, color_id: str):
+            self.completion_patches.append((event_id, summary, color_id))
+            return SimpleNamespace(action="completion_updated")
+
+    client = _FakeCompletionClient()
+    result = pipeline._sync_google_calendar_academic_colors(
+        client,
+        time_min=now - timedelta(days=30),
+        time_max=now + timedelta(days=30),
+        timezone_name="Asia/Seoul",
+    )
+
+    assert result["ok"] is True
+    assert result["scanned_events"] == 2
+    assert result["updated_events"] == 2
+    assert client.color_patches == []
+    assert client.completion_patches == [
+        (
+            "manual-presentation",
+            "사이버기술과법 발표 [완료]",
+            pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED,
+        ),
+        (
+            "manual-cykor",
+            "Cykor [완료]",
+            pipeline.GOOGLE_CALENDAR_COLOR_COMPLETED,
+        ),
+    ]
+
+
+def test_lms_calendar_assignment_status_respects_unsubmitted_submission() -> None:
+    assert (
+        pipeline._lms_calendar_assignment_status(
+            assignment={"has_submitted_submissions": True},
+            submission={
+                "submitted_at": "",
+                "workflow_state": "unsubmitted",
+                "missing": False,
+            },
+        )
+        == "open"
+    )
+
+
+def test_lms_authoritative_upsert_can_reopen_task(tmp_path: Path) -> None:
+    db = Database(tmp_path / "ku.db")
+    db.init()
+    db.upsert_task(
+        external_id="ku_lms:assignment:1",
+        source="ku_lms",
+        due_at="2026-05-04T14:59:59+00:00",
+        title="사이버기술과법 과제",
+        status="done",
+        metadata_json={"workflow_state": "submitted"},
+        user_id=1,
+    )
+
+    task = db.upsert_task(
+        external_id="ku_lms:assignment:1",
+        source="ku_lms",
+        due_at="2026-05-04T14:59:59+00:00",
+        title="사이버기술과법 과제",
+        status="open",
+        metadata_json={"workflow_state": "unsubmitted"},
+        user_id=1,
+        preserve_done_open=False,
+    )
+
+    assert task.status == "open"
+    stored = next(
+        item
+        for item in db.list_tasks(user_id=1)
+        if item.external_id == "ku_lms:assignment:1" and item.source == "ku_lms"
+    )
+    assert stored.status == "open"
 
 
 def test_lms_calendar_persist_canvas_records_stores_completed_assignments(

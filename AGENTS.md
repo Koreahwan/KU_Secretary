@@ -2,6 +2,8 @@
 
 Keep this file short. Repository-level agent instructions help only when they add non-obvious, repo-specific constraints; detailed procedures belong in `README.md`.
 
+Always read `AGENT_MEMORY.md` before changing sync, calendar, task status, or Telegram behavior.
+
 ## Scope
 
 - This repository runs two real instances:
@@ -49,6 +51,13 @@ Keep this file short. Repository-level agent instructions help only when they ad
 - KU LMS is **Canvas** (mylms.korea.ac.kr), not Blackboard. Auth flows assume KSSO SAML SSO + RSA-decrypted Canvas password handoff (see `src/ku_secretary/_kupid/lms.py`).
 - KSSO accounts with OTP enabled cannot complete Canvas SSO — surface this clearly to users instead of retry-looping.
 - Do not widen supported-school messaging or defaults without an explicit product decision.
+
+## Calendar Safety
+
+- Google Calendar sync must never modify or delete user-created events.
+- If the user manually changes the schedule fields of a KU Secretary-created event in Google Calendar (date, time, or all-day state), future syncs must skip that event instead of overwriting it.
+- Exception: Google Calendar color may be updated for academic events (exam/assignment/quiz/presentation) and explicit user-added recurring activities such as `기해실`/`Cykor` to distinguish completed vs incomplete; this color-only patch is allowed even for user-created or manually rescheduled events.
+- Exception: if one of those tracked events is past its actual Google Calendar end time, sync may also append `[완료]` to the title while leaving schedule and other content untouched.
 
 ## Vendored ku-portal-mcp (v0.10.1, MIT)
 

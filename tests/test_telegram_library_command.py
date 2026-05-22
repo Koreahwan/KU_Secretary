@@ -370,6 +370,7 @@ def test_format_assignment_detail_and_week_use_assignments_cache(monkeypatch, tm
 
     db = Database(tmp_path / "ku.db")
     db.init()
+    due_date = (datetime.now(timezone.utc) + timedelta(days=2)).strftime("%Y-%m-%d")
     monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
     monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
     monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
@@ -379,13 +380,13 @@ def test_format_assignment_detail_and_week_use_assignments_cache(monkeypatch, tm
         ku_lms,
         "get_announcements",
         lambda s, course_ids: [
-            {
-                "context_code": "course_11",
-                "title": "보고서 제출 안내",
-                "message": "보고서 과제는 2026-05-01 23:59까지 제출하세요.",
-            }
-        ],
-    )
+                {
+                    "context_code": "course_11",
+                    "title": "보고서 제출 안내",
+                    "message": f"보고서 과제는 {due_date} 23:59까지 제출하세요.",
+                }
+            ],
+        )
     monkeypatch.setattr(ku_lms, "get_modules", lambda s, course_id, *, include_items=True: [])
     monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [])
 
@@ -712,22 +713,40 @@ def test_format_assignments_scans_each_course(monkeypatch):
     monkeypatch.setenv("KU_PORTAL_PW", "pw")
     from ku_secretary.connectors import ku_lms
 
+    calls: list[tuple[int, bool]] = []
     monkeypatch.setattr(ku_lms, "login", lambda *, user_id, password: "s")
     monkeypatch.setattr(ku_lms, "get_todo", lambda s: [])
     monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
     monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 11, "name": "사이버기술과법"}])
     monkeypatch.setattr(
         ku_lms,
-        "get_assignments",
-        lambda s, course_id, *, upcoming_only=False: [
-            {"id": 1, "name": "개별 강의 과제", "due_at": "2026-04-30T14:00:00Z"}
+        "get_submissions",
+        lambda s, course_id: [
+            {
+                "assignment_id": 2,
+                "workflow_state": "submitted",
+                "submitted_at": "2026-06-01T01:00:00Z",
+            }
         ],
     )
 
+    def fake_assignments(s, course_id, *, upcoming_only=False):
+        calls.append((course_id, upcoming_only))
+        if upcoming_only:
+            return []
+        return [
+            {"id": 1, "name": "개별 강의 과제", "due_at": "2026-06-30T14:00:00Z"},
+            {"id": 2, "name": "제출 끝난 과제", "due_at": "2026-07-01T14:00:00Z"},
+        ]
+
+    monkeypatch.setattr(ku_lms, "get_assignments", fake_assignments)
+
     out = pipeline._format_telegram_assignments()
+    assert calls == [(11, False)]
     assert "[사이버기술과법]" in out
     assert "- 1. 개별 강의 과제" in out
-    assert "  마감 04/30 23:00" in out
+    assert "제출 끝난 과제" not in out
+    assert "  마감 06/30 23:00" in out
 
 
 def test_format_assignments_skips_restricted_shell_courses(monkeypatch):
@@ -753,6 +772,7 @@ def test_format_assignments_skips_restricted_shell_courses(monkeypatch):
         return []
 
     monkeypatch.setattr(ku_lms, "get_assignments", fake_assignments)
+    monkeypatch.setattr(ku_lms, "get_submissions", lambda s, course_id: [])
     monkeypatch.setattr(ku_lms, "get_announcements", lambda s, course_ids: [])
     monkeypatch.setattr(ku_lms, "get_modules", lambda s, course_id, *, include_items=True: [])
     monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [])
@@ -773,6 +793,16 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
     monkeypatch.setattr(ku_lms, "get_upcoming_events", lambda s: [])
     monkeypatch.setattr(ku_lms, "get_courses", lambda s: [{"id": 11, "name": "사이버기술과법"}])
     monkeypatch.setattr(ku_lms, "get_assignments", lambda s, course_id, *, upcoming_only=False: [])
+    monkeypatch.setattr(ku_lms, "get_submissions", lambda s, course_id: [])
+    base_due = datetime.now(timezone.utc) + timedelta(days=2)
+    report_due = base_due.strftime("%Y-%m-%d")
+    hw_due = (base_due + timedelta(days=2)).strftime("%Y.%m.%d")
+    module_due = (base_due + timedelta(days=1)).strftime("%Y-%m-%d")
+    board_due = (base_due + timedelta(days=3)).strftime("%Y-%m-%d")
+    report_label = base_due.strftime("%m/%d")
+    hw_label = (base_due + timedelta(days=2)).strftime("%m/%d")
+    module_label = (base_due + timedelta(days=1)).strftime("%m/%d")
+    board_label = (base_due + timedelta(days=3)).strftime("%m/%d")
     monkeypatch.setattr(
         ku_lms,
         "get_announcements",
@@ -782,29 +812,29 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
                 "title": "중간고사 과제 우수자 발표 안내",
                 "message": "중간고사 과제 우수자는 2026-05-01 발표 예정입니다.",
             },
-            {
-                "context_code": "course_11",
-                "title": "보고서 제출 안내",
-                "message": "보고서 과제는 2026-05-01 23:59까지 제출하세요.",
-            },
-            {
-                "context_code": "course_11",
-                "title": "HW#1 공지",
-                "message": "개선된 code와 ppt를 제출 바랍니다. 제출 마감: 2025.5.3 오후 7시까지",
-            }
-        ],
-    )
+                {
+                    "context_code": "course_11",
+                    "title": "보고서 제출 안내",
+                    "message": f"보고서 과제는 {report_due} 23:59까지 제출하세요.",
+                },
+                {
+                    "context_code": "course_11",
+                    "title": "HW#1 공지",
+                    "message": f"개선된 code와 ppt를 제출 바랍니다. 제출 마감: {hw_due} 오후 7시까지",
+                }
+            ],
+        )
     monkeypatch.setattr(
         ku_lms,
         "get_modules",
         lambda s, course_id, *, include_items=True: [
-            {
-                "name": "10주차",
-                "items": [
-                    {"title": "실습 과제 제출 2026-05-02 18:00", "type": "File"}
-                ],
-            }
-        ],
+                {
+                    "name": "10주차",
+                    "items": [
+                        {"title": f"실습 과제 제출 {module_due} 18:00", "type": "File"}
+                    ],
+                }
+            ],
     )
     monkeypatch.setattr(ku_lms, "list_boards", lambda s, course_id: [{"id": 3, "name": "자료실"}])
     monkeypatch.setattr(
@@ -818,7 +848,7 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
         ku_lms,
         "get_board_post",
         lambda s, course_id, board_id, post_id: {
-            "body": "게시판 과제는 2026-05-03 12:00까지 제출"
+            "body": f"게시판 과제는 {board_due} 12:00까지 제출"
         },
     )
 
@@ -826,11 +856,11 @@ def test_format_assignments_scans_announcements_materials_and_boards(monkeypatch
     assert "공지/자료/게시판 제출 항목" in out
     assert "중간고사 과제 우수자 발표 안내" not in out
     assert "[사이버기술과법]" in out
-    assert "  공지 | 마감 05/01 23:59" in out
+    assert f"  공지 | 마감 {report_label} 23:59" in out
     assert "HW#1 공지" in out
-    assert "  공지 | 마감 05/03 19:00" in out
-    assert "  모듈/자료 | 마감 05/02 18:00" in out
-    assert "  게시판 자료실 | 마감 05/03 12:00" in out
+    assert f"  공지 | 마감 {hw_label} 19:00" in out
+    assert f"  모듈/자료 | 마감 {module_label} 18:00" in out
+    assert f"  게시판 자료실 | 마감 {board_label} 12:00" in out
     assert "확인: 1개 과목의 과제 목록과 공지/자료/게시판 제출 항목을 직접 확인했습니다." in out
 
 
